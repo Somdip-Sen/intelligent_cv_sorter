@@ -1,0 +1,9 @@
+# Core
+python-dotenv         # To manage our API keys securely
+
+# LLM for Data Generation (choose one)
+google-generativeai # For Gemini
+# openai            # Or for OpenAI models
+
+# Data Handling
+pandas
