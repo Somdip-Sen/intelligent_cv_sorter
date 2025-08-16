@@ -1,0 +1,2 @@
+seed: 42
+generation_prime: 10007   # for per-generation RNG isolation
