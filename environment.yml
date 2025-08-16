@@ -1,0 +1,29 @@
+name: CV_sorter
+channels:
+  - defaults
+  - conda-forge
+dependencies:
+  # --- Conda Packages ---
+  # It's best practice to install what you can from conda channels first
+  - python=3.11
+  - pip
+  - pandas
+  - python-dotenv
+  - pyyaml         # The standard package for YAML in Python
+  - pydantic
+  - protobuf
+  - numpy
+
+  # --- Pip Packages ---
+  # Use pip for packages not available on conda channels or for the latest versions
+  - pip:
+    - google-generativeai
+
+protobuf
+python-dotenv
+numpy
+mlflow
+datasketch
+yaml
+pyyaml
+pydantic

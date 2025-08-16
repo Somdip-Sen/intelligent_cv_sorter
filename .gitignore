@@ -99,6 +99,7 @@ extra_datasets/
 # Results and outputs
 results/
 outputs/
+mlruns/
 figures/
 plots/
 *.png
