@@ -63,6 +63,7 @@ def parse_multi_part_response(response_text: str) -> Dict[str, Any]:
             m = re.search(r"\{.*\}", no_fence, re.DOTALL)
             if not m:
                 # No JSON found → treat whole thing as markdown
+                print("[committee-parse-fail]", s[:200].replace("\n", " ") + " ...")
                 parts["markdown"] = s
                 return parts
             json_obj = m.group(0)
@@ -159,7 +160,8 @@ def run_candidate_agent(candidate_inputs: Dict[str, Any]) -> Dict[str, Any]:
     return parse_multi_part_response(resp.text)
 
 
-def run_recruiter_agent_json(job_description: str, cv_text: str, judge_id: str = "judge-0", profile: dict | None = None) -> Dict[str, Any]:
+def run_recruiter_agent_json(job_description: str, cv_text: str, judge_id: str = "judge-0",
+                             profile: dict | None = None) -> Dict[str, Any]:
     """
     Uses recruiter prompt but enforces JSON subscores + overall.
     Expected JSON shape:
@@ -202,7 +204,7 @@ def run_recruiter_agent_json(job_description: str, cv_text: str, judge_id: str =
     seed_src = f"{judge_id}|{hash(job_description) % 10 ** 9}|{hash(cv_text) % 10 ** 9}|{cfg.seed}"
     seed = int(hashlib.sha256(seed_src.encode()).hexdigest(), 16) % 10 ** 9
     rng = random.Random(seed)
-    
+
     seed_token = rng.randint(1000, 9999)
     persona_hint += f"\n- calibration_token: {seed_token}"
     vars_dict = {"job_description": job_description, "cv_text": cv_text}
@@ -360,35 +362,143 @@ def tailor_cv(persona: Dict[str, Any], jd: Dict[str, Any]) -> Dict[str, Any]:
     return cv
 
 
+def run_recruiter_committee_once(job_description: str, cv_text: str, profiles: list[dict]) -> list[dict]:
+    model = _model()
+    tmpl = load_prompt("src/prompts/recruiter_agent_prompt.txt")
+
+    # Build orthogonal judge profiles: weights + views + calibration tokens
+    prof_lines = []
+    for i, p in enumerate(profiles):
+        w = p.get("weights", {
+            "must_have_coverage": 0.20, "impact_evidence": 0.15, "recency_seniority": 0.10,
+            "tech_depth": 0.20, "ats_readability": 0.10, "realism": 0.25
+        })
+        view = p.get("view", "full")  # "full" | "must_haves_only" | "resp_only"
+        cal = 1117 + 37 * i  # simple per-judge calibration token
+        prof_lines.append(
+            " - judge_id: judge-{i}; style: {label}; strictness: {s}; emphasis: {focus}; "
+            "weights: {w}; view: {view}; calibration_token: {cal}".format(
+                i=i, label=p.get("label", "balanced"), s=p.get("strictness", 1.0),
+                focus=", ".join(p.get("focus", [])) or "none", w=w, view=view, cal=cal
+            ))
+
+    committee_hint = (
+            "\n\n[JUDGE COMMITTEE]\n" + "\n".join(prof_lines) +
+            "\nEach judge must evaluate INDEPENDENTLY using their own weights/view; "
+            "do NOT copy or average other judges' scores."
+            "\nEnforce diversity: the pairwise L1 distance between judges' SUBSCORE vectors "
+            "should be >= 0.06 when evidence permits. If too similar, adjust minimally per profile."
+            "\nReturn an ARRAY of JSON objects (same order)."
+    )
+
+    contract = (
+        "\n\n[OUTPUT CONTRACT]\n"
+        "Return MINIFIED JSON ONLY: "
+        "[{\"judge_id\":\"judge-0\",\"subscores\":{\"must_have_coverage\":0.9,\"impact_evidence\":0.8,"
+        "\"recency_seniority\":0.8,\"tech_depth\":0.7,\"ats_readability\":0.9,\"realism\":0.8},\"overall\":0.85}, ...]"
+        "\nNo prose."
+    )
+
+    # Optional: give different JD 'views' per judge (the model still sees all, but is told what to consider)
+    # (keep jd_desc concise)
+    jd_full = job_description
+    vars_dict = {"job_description": jd_full, "cv_text": cv_text}
+    prompt = safe_curly_format(tmpl, vars_dict) + committee_hint + contract
+
+    from google.generativeai.types import GenerationConfig
+    resp = model.generate_content(prompt, generation_config=GenerationConfig(
+        temperature=0.45, top_p=0.9, top_k=50, max_output_tokens=1024
+    ))
+
+    txt = resp.text.strip()
+    # Parse committee array
+    m = re.search(r"\[.*\]", txt, re.DOTALL)
+    arr = json.loads(m.group(0)) if m else []
+    out = []
+
+    def clamp01(x):
+        try:
+            return max(0.0, min(1.0, float(x)))
+        except:
+            return 0.0
+
+    for obj in arr:
+        subs = obj.get("subscores", {})
+        out.append({
+            "judge_id": obj.get("judge_id", "judge-0"),
+            "subscores": {
+                "must_have_coverage": clamp01(subs.get("must_have_coverage", 0)),
+                "impact_evidence": clamp01(subs.get("impact_evidence", 0)),
+                "recency_seniority": clamp01(subs.get("recency_seniority", 0)),
+                "tech_depth": clamp01(subs.get("tech_depth", 0)),
+                "ats_readability": clamp01(subs.get("ats_readability", 0)),
+                "realism": clamp01(subs.get("realism", 0)),
+            },
+            "overall": clamp01(obj.get("overall", 0))
+        })
+    return out
+
+
 def score_cv_committee(cv: Dict[str, Any], jd: Dict[str, Any], n_judges: int = 3) -> List[Dict[str, Any]]:
     """
-    Calls the recruiter agent multiple times with slight style hints (committee)
-    and returns a list of dicts: each with 'judge_id', 'subscores', 'overall' in [0,1].
+    One-call committee by default. Falls back to single-judge calls only if parsing fails.
+    Returns list of {cv_id, jd_id, judge_id, subscores, overall}.
     """
-    jd_desc = jd.get("raw_text", "")
+    # Token-diet JD for speed
+    musts = jd.get("must_haves", [])[:8]
+    resp = jd.get("responsibilities", [])[:5]
+    jd_desc = "Must haves: " + ", ".join(musts)
+    if resp:
+        jd_desc += "\nTop responsibilities: " + "; ".join(resp)
+
     cv_text = cv.get("raw_markdown") or cv.get("raw_text", "")
 
-    # three complementary judges (reproducible personas)
+    # three orthogonal complementary judges (reproducible personas)
     profiles = [
-                   {"strictness": 1.15, "focus": ["realism", "tech_depth"], "label": "conservative"},
-                   {"strictness": 1.00, "focus": [], "label": "balanced"},
-                   {"strictness": 0.90, "focus": ["impact_evidence", "ats_readability"], "label": "optimistic"},
+                   {"label": "conservative", "strictness": 1.15, "focus": ["realism", "tech_depth"],
+                    "weights": {"realism": 0.30, "tech_depth": 0.25, "must_have_coverage": 0.20,
+                                "impact_evidence": 0.10,
+                                "recency_seniority": 0.10, "ats_readability": 0.05},
+                    "view": "must_haves_only"},
+                   {"label": "balanced", "strictness": 1.00, "focus": [],
+                    "weights": {"realism": 0.15, "tech_depth": 0.15, "must_have_coverage": 0.25,
+                                "impact_evidence": 0.20,
+                                "recency_seniority": 0.15, "ats_readability": 0.10},
+                    "view": "full"},
+                   {"label": "optimistic", "strictness": 0.90, "focus": ["impact_evidence", "ats_readability"],
+                    "weights": {"realism": 0.10, "tech_depth": 0.15, "must_have_coverage": 0.20,
+                                "impact_evidence": 0.30,
+                                "recency_seniority": 0.10, "ats_readability": 0.15},
+                    "view": "resp_only"},
                ][:n_judges]
 
-    scores: List[Dict[str, Any]] = []
-    for i, prof in enumerate(profiles):
-        s = run_recruiter_agent_json(jd_desc, cv_text, judge_id=f"judge-{i}", profile=prof)
-        scores.append({
-            "cv_id": cv.get("id"),
-            "jd_id": jd.get("id"),
+    # === One-call committee ===
+    committee = run_recruiter_committee_once(jd_desc, cv_text, profiles)
+
+    # If parsing failed or empty, fall back to per-judge calls (rare)
+    if not committee or len(committee) < n_judges:
+        scores = []
+        for i, prof in enumerate(profiles):
+            s = run_recruiter_agent_json(jd_desc, cv_text, judge_id=f"judge-{i}", profile=prof)
+            scores.append({
+                "cv_id": cv["id"], "jd_id": jd["id"], "judge_id": s["judge_id"],
+                "subscores": s["subscores"], "overall": float(s["overall"])
+            })
+        return scores
+    # Use committee results directly (NO extra LLM calls)
+    out = []
+    for i, s in enumerate(committee[:n_judges]):
+        subs = s["subscores"]
+        prof_w = profiles[i]["weights"]  # weights you passed in
+        out.append({
+            "cv_id": cv["id"], "jd_id": jd["id"],
             "judge_id": s.get("judge_id", f"judge-{i}"),
-            "subscores": s.get("subscores", {}),
-            "overall": float(s.get("overall", 0.0))
+            "subscores": subs,
+            "overall": _weighted_overall(subs, prof_w)
         })
-    return scores
+    return out
 
 
-# -----------------------------
 # Helpers
 # -----------------------------
 def _markdown_to_text(md: str) -> str:
@@ -401,7 +511,15 @@ def _markdown_to_text(md: str) -> str:
     return text.strip()
 
 
-# -----------------------------
+SCORE_KEYS = ["must_have_coverage", "impact_evidence", "recency_seniority", "tech_depth", "ats_readability", "realism"]
+
+
+def _weighted_overall(subs: dict[str, float], weights: dict[str, float]) -> float:
+    # normalize weights in case they don’t sum to 1.0
+    z = sum(weights.get(k, 0.0) for k in SCORE_KEYS) or 1.0
+    return float(sum((weights.get(k, 0.0) / z) * float(subs.get(k, 0.0)) for k in SCORE_KEYS))
+
+
 # Demo run (optional)
 # -----------------------------
 if __name__ == "__main__":
@@ -421,7 +539,8 @@ if __name__ == "__main__":
     scores = score_cv_committee(cv, jd, n_judges=3)
 
     print("\n=== JD (markdown head) ===")
-    print(jd.get("raw_text", "")[:2000], "...\n") # prints only the first 400 characters and then literally appends an ellipsis.
+    print(jd.get("raw_text", "")[:2000],
+          "...\n")  # prints only the first 400 characters and then literally appends an ellipsis.
     print("=== CV (markdown head) ===")
     print(cv.get("raw_markdown", "")[:2000], "...\n")
     print("=== Committee scores ===")
