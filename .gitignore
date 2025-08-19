@@ -165,6 +165,10 @@ MANIFEST
 pip-log.txt
 pip-delete-this-directory.txt
 
+# Extra logs
+logs/
+scripts/
+
 # Unit test / coverage reports
 htmlcov/
 .tox/
@@ -336,7 +340,6 @@ __marimo__/
 # --------------------------------------------------
 src/agents/agent_orchestrator_old.py
 src/prompts/Backup/
-src/prompts/job_agent_prompt2.txt
 generate_structured_data.py
 
 
