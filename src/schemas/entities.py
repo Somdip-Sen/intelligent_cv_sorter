@@ -2,7 +2,7 @@
 
 from pydantic import BaseModel, Field, HttpUrl, EmailStr, validator
 # Ref: Pydantic models, which inherit from BaseModel, allow you to define the structure of your data using Python type hints.
-from typing import List, Optional, Dict
+from typing import List, Optional, Dict, Any
 from datetime import date
 
 
@@ -14,7 +14,7 @@ class Persona(BaseModel):
     seniority: str
     domain: str
     skills_seed: List[str]
-    constraints: Dict[str, str] = {}
+    constraints: Dict[str, Any] = Field(default_factory=dict)
 
 
 class JobJD(BaseModel):
@@ -24,9 +24,9 @@ class JobJD(BaseModel):
     company_stage: Optional[str] = None
     domain: str
     location: Optional[str] = None
-    must_haves: List[str]
-    nice_to_haves: List[str] = []
-    responsibilities: List[str] = []
+    must_haves: List[str] = Field(default_factory=list)
+    nice_to_haves: List[str] = Field(default_factory=list)
+    responsibilities: List[str] = Field(default_factory=list)
     salary_hint: Optional[str] = None
     raw_text: str
 
@@ -39,7 +39,7 @@ class EvidenceLink(BaseModel):
 class CVSection(BaseModel):
     header: str
     bullets: List[str]
-    evidence: List[EvidenceLink] = []
+    evidence: List[EvidenceLink] = Field(default_factory=list)
 
 
 class CVDoc(BaseModel):
@@ -49,8 +49,10 @@ class CVDoc(BaseModel):
     jd_id: str
     role_claim: str
     seniority_claim: Optional[str] = None
-    contacts: Dict[str, Optional[str]] = {"name": None, "email": None, "phone": None, "links": None}
-    skills: List[str] = []
+    contacts: Dict[str, Optional[str]] = Field(
+        default_factory=lambda: {"name": None, "email": None, "phone": None, "links": None}
+    )
+    skills: List[str] = Field(default_factory=list)
     sections: List[CVSection]
     raw_markdown: str
     raw_text: str
@@ -73,4 +75,4 @@ class SampleRecord(BaseModel):
     jd: JobJD
     persona: Persona
     scores: List[RecruiterScore]
-    meta: Dict[str, str] = {}
+    meta: Dict[str, str] = Field(default_factory=dict)
