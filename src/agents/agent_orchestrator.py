@@ -1,3 +1,17 @@
+# smoke test -> export N_PERSONAS=10 N_JOBS=2 GENAI_RPM_SLEEP=1.1 (for the whole terminal) or
+# N_PERSONAS=5 N_JOBS=1 GENAI_RPM_SLEEP=1.1 python -m src.pipeline.generate_epoch --output data/synth/raw --generation 0/1/2/3/...
+
+# with pro
+# export GEMINI_MODEL_JOB="models/gemini-2.5-flash"
+# export GEMINI_MODEL_CANDIDATE="models/gemini-2.5-flash"
+#
+# # stronger judge on Pro
+# export GEMINI_MODEL_RECRUITER="models/gemini-2.5-pro"
+#
+# # (optional) run-size & budget for the day
+# export N_PERSONAS=8 N_JOBS=2 LLM_BUDGET=80 GENAI_RPM_SLEEP=0.8
+# python -m src.pipeline.generate_epoch --output data/synth/raw --generation 3
+
 import os
 import random
 import re
@@ -7,12 +21,14 @@ import uuid
 import hashlib
 from typing import List, Dict, Any, Optional
 from dotenv import load_dotenv
+
 from src.evolution.style_genes import gen_style_profile
 import google.generativeai as genai
 from google.generativeai.types import GenerationConfig
 import yaml
 from src.config.settings import load_cfg
 from src.utils.run_ctx import set_seed
+from src.utils.cache import call_with_cache, debug_dump
 
 cfg = load_cfg()  # or load_cfg(cli_seed=args.seed)
 set_seed(cfg.seed)  # your existing helper
@@ -29,6 +45,21 @@ MODEL_NAME = os.getenv("GEMINI_MODEL", "models/gemini-1.5-flash-latest")
 RPM_SLEEP_SEC = float(os.getenv("GENAI_RPM_SLEEP", "1.1"))  # throttle safety
 
 
+def mk_model(env_var: str, default_name: str):
+    name = os.getenv(env_var, default_name)
+    try:
+        # Newer SDKs accept the 'model' kwarg
+        return genai.GenerativeModel(model=name)
+    except TypeError:
+        # Older examples allow positional
+        return genai.GenerativeModel(name)
+
+
+job_model = mk_model("GEMINI_MODEL_JOB", "gemini-1.5-flash")
+candidate_model = mk_model("GEMINI_MODEL_CANDIDATE", "gemini-1.5-flash")
+recruiter_model = mk_model("GEMINI_MODEL_RECRUITER", "gemini-1.5-pro")
+
+
 # Utilities
 # -----------------------------
 def load_prompt(file_path: str) -> str:
@@ -39,59 +70,153 @@ def load_prompt(file_path: str) -> str:
         return f"ERROR: Prompt file not found at {file_path}"
 
 
+def _skills_to_strings(sk) -> list[str]:
+    """
+    Accepts skills as:
+      - list[str]
+      - list[dict] like {"name": "...", "keywords": ["..."], "level": "..."}
+    Returns a deduped flat list[str].
+    """
+    if not sk:
+        return []
+    out = []
+    for item in sk:
+        if isinstance(item, str):
+            out.append(item)
+        elif isinstance(item, dict):
+            # prefer 'name', then merge a few keywords
+            name = item.get("name")
+            if name:
+                out.append(str(name))
+            kws = item.get("keywords") or []
+            # keep it tight to avoid blowing up the list
+            for k in kws[:6]:
+                if isinstance(k, str):
+                    out.append(k)
+    # dedupe, preserve order
+    seen = set();
+    flat = []
+    for s in out:
+        s = s.strip()
+        if s and s.lower() not in seen:
+            seen.add(s.lower());
+            flat.append(s)
+    return flat
+
+
 def parse_multi_part_response(response_text: str) -> Dict[str, Any]:
     """
     Robustly split a response that may contain:
-      - Part 1: Markdown resume
-      - Part 2: '## OUTPUT — PART 2 (Structured JSON)' + minified JSON
-      - (optionally) code-fenced JSON first, or JSON-only
-    Returns: {'markdown': str, 'json': dict}
+        - Recruiter: pure JSON (object or array) → {"json": <obj/arr>, "markdown": "", "diag": None}
+        - JD/Candidate: JSON --- Markdown resume [--- YAML] → returns all three parts
+        - Fallbacks: first JSON/array found; else YAML-as-JSON; else markdown-only
+    Returns: {'json': dict,  'markdown': str, 'diag': dict }
     """
-    parts = {"markdown": "", "json": {}}
-    s = response_text.strip()
-    sep = "## OUTPUT — PART 2 (Structured JSON)"
+    s = (response_text or "").strip()
+    out = {"markdown": "", "json": {}, "diag": None}
+    if not s:
+        return out
 
+    def strip_fences(x: str) -> str:
+        # remove ```json / ```yaml / ``` fences if present
+        return re.sub(r"```(?:json|yaml)?|```", "", x, flags=re.IGNORECASE).strip()
+
+    # 0) Pure JSON (recruiter single/committee)
     try:
-        # 1) Preferred path: use the canonical separator header
-        if sep in s:
-            md, rest = s.split(sep, 1)
-            parts["markdown"] = md.strip()
-            json_str = rest
-        else:
-            # 2) Fallback: strip code fences to search for the first JSON object anywhere
-            no_fence = re.sub(r"```json|```", "", s)
-            m = re.search(r"\{.*\}", no_fence, re.DOTALL)
-            if not m:
-                # No JSON found → treat whole thing as markdown
-                print("[committee-parse-fail]", s[:200].replace("\n", " ") + " ...")
-                parts["markdown"] = s
-                return parts
-            json_obj = m.group(0)
-            # markdown is everything BEFORE that JSON object (from the original string)
-            parts["markdown"] = s[: s.find(json_obj)].strip()
-            json_str = json_obj
-
-        # 3) Clean up and parse JSON
-        json_str = re.sub(r"```json|```", "", json_str).strip()
-        last_brace = json_str.rfind("}")
-        if last_brace != -1:
-            json_str = json_str[: last_brace + 1]
-        parts["json"] = json.loads(json_str) if json_str else {}
-
+        out["json"] = json.loads(strip_fences(s))
+        return out
     except Exception:
-        # As a last resort: leave markdown as-is and try YAML→dict (optional)
+        pass
+
+    # 1) New canonical: JSON --- Markdown [--- YAML]
+    parts = re.split(r'(?m)^\s*---\s*$', s)
+    if len(parts) >= 2:
+        first = strip_fences(parts[0])
+        # JSON object or array
         try:
-            y = yaml.safe_load(s)
-            if isinstance(y, dict):
-                parts["json"] = y
+            out["json"] = json.loads(first)
+        except Exception:
+            # extract first {...} or [...] if extra text crept in
+            m = re.search(r'[\{\[][\s\S]*[\}\]]', first)
+            if m:
+                try:
+                    out["json"] = json.loads(m.group(0))
+                except Exception:
+                    pass
+
+        out["markdown"] = parts[1].strip()
+
+        if len(parts) >= 3:
+            diag_raw = strip_fences(parts[2])
+            try:
+                out["diag"] = yaml.safe_load(diag_raw)
+            except Exception:
+                out["diag"] = diag_raw  # keep raw if YAML parse fails
+        return out
+
+    # 2) Fallback: find first JSON object/array anywhere; markdown is the prefix
+    no_fence = strip_fences(s)
+    m = re.search(r'[\{\[][\s\S]*[\}\]]', no_fence)
+    if m:
+        try:
+            out["json"] = json.loads(m.group(0))
+            out["markdown"] = s[: s.find(m.group(0))].strip()
+            return out
         except Exception:
             pass
 
-    return parts
+    # 3) Fallback: try parsing whole payload YAML-as-JSON
+    try:
+        y = yaml.safe_load(no_fence)
+        if isinstance(y, (dict, list)):
+            out["json"] = y
+            return out
+    except Exception:
+        pass
+
+    # 4) Give up → markdown-only
+    print("[parse-fail]", s[:200].replace("\n", " "), "...")
+    out["markdown"] = s
+    return out
 
 
-def _model() -> genai.GenerativeModel:
-    return genai.GenerativeModel(MODEL_NAME)
+def _model(agent: str) -> genai.GenerativeModel:
+    """
+    agent ∈ {"job","candidate","recruiter"} → choose model per agent via env.(compatible with old/new SDKs.)
+    Fallbacks keep you productive even if env vars are unset.
+    """
+    # precedence: agent-specific → global → sensible default
+    default_map = {
+        "job": "models/gemini-2.5-flash",
+        "candidate": "models/gemini-2.5-flash",
+        "recruiter": "models/gemini-2.5-pro",
+    }
+    name = (
+            os.getenv(f"GEMINI_MODEL_{agent.upper()}") or
+            os.getenv("GEMINI_MODEL") or
+            default_map.get(agent, "models/gemini-2.5-flash")
+    )
+
+    m = None
+    for ctor in (
+            lambda n: genai.GenerativeModel(model=n),  # newer SDKs
+            lambda n: genai.GenerativeModel(model_name=n),  # some mid versions
+            lambda n: genai.GenerativeModel(n),  # older positional
+    ):
+        try:
+            m = ctor(name)
+            break
+        except TypeError:
+            continue
+    if m is None:
+        raise RuntimeError("Unable to construct GenerativeModel; upgrade google.generativeai.")
+
+    # optional: expose a label for caching without touching read-only props
+    try:
+        setattr(m, "_cache_model_label", name)
+    except Exception:
+        pass
+    return m
 
 
 def _sleep():
@@ -121,7 +246,7 @@ def run_job_agent(job_details: Dict[str, Any]) -> Dict[str, Any]:
     """
     Returns {'markdown': <str>, 'json': <dict>} from the job agent prompt.
     """
-    model = _model()
+    model = _model("job")
     prompt_template = load_prompt("src/prompts/job_agent_prompt.txt")
 
     # Ensure all placeholders exist
@@ -134,16 +259,37 @@ def run_job_agent(job_details: Dict[str, Any]) -> Dict[str, Any]:
     }
     defaults.update(job_details)
     prompt = safe_curly_format(prompt_template, defaults)
-    resp = model.generate_content(prompt)
-    _sleep()
-    return parse_multi_part_response(resp.text)
+    gen_cfg = {"temperature": 0.50, "top_p": 0.9, "top_k": 48,
+               # "response_mime_type": "application/json",  # # JSON-only mode (ignored by older SDKs)
+               "max_output_tokens": int(os.getenv("MAX_OUTPUT_TOKENS", '5000'))}
+    _print_prompt_tokens(model, prompt, "job_agent")
+    data = call_with_cache(model, prompt, generation_config=gen_cfg)  # cache key = (MODEL, prompt)
+    if not data.get("cached"):
+        _sleep()
+    parts = parse_multi_part_response(data["text"])
+    debug_dump("job", data["text"], parts.get("json"), data.get("finish_reason"))
+    if not parts.get("json"):
+        # one retry: force JSON-only
+        data = call_with_cache(
+            model,
+            prompt + "\n\n[OUTPUT CONTRACT]\nReturn JSON ONLY. Start with '{' and end with '}'.",
+            generation_config=gen_cfg,
+        )
+        if not data.get("cached"): _sleep()
+        parts = parse_multi_part_response(data["text"])
+        debug_dump("job", data["text"], parts.get("json"), data.get("finish_reason"))
+
+        if not parts.get("json"):
+            parts["json"] = {"_parse_error": True}
+
+    return parts
 
 
 def run_candidate_agent(candidate_inputs: Dict[str, Any]) -> Dict[str, Any]:
     """
     Returns {'markdown': <str>, 'json': <dict>} from the candidate agent prompt.
     """
-    model = _model()
+    model = _model("candidate")
     prompt_template = load_prompt("src/prompts/candidate_agent_prompt.txt")
 
     defaults = {
@@ -153,11 +299,94 @@ def run_candidate_agent(candidate_inputs: Dict[str, Any]) -> Dict[str, Any]:
         "legal": "", "redact_pii": "true"
     }
     defaults.update(candidate_inputs)
-
     prompt = safe_curly_format(prompt_template, defaults)
-    resp = model.generate_content(prompt)
-    _sleep()
-    return parse_multi_part_response(resp.text)
+    # seed variability (deterministic across runs)
+    seed_src = f"cand|{defaults.get('generation')}|{defaults.get('mutation_seed')}|{cfg.seed}"
+    seed = int(hashlib.sha256(seed_src.encode()).hexdigest(), 16) % 10 ** 9
+    rng = random.Random(seed)
+    gen_cfg = {
+        "temperature": 0.45 + 0.20 * rng.random(),  # 0.45–0.65
+        "top_p": 0.9, "top_k": 48,
+        # "response_mime_type": "application/json",  # # JSON-only mode (ignored by older SDKs)
+        "max_output_tokens": 9000,
+        "stop_sequences": ["\n## END"]
+    }
+    _print_prompt_tokens(model, prompt, "candidate_agent")
+    data = call_with_cache(model, prompt, generation_config=gen_cfg)
+    if not data.get("cached"): _sleep()
+    parts = parse_multi_part_response(data["text"])
+    debug_dump("candidate", data["text"], parts.get("json"), data.get("finish_reason"))
+
+    # Retry once if JSON missing
+    if not parts.get("json"):
+        data = call_with_cache(
+            model,
+            prompt + "\n\n[OUTPUT CONTRACT]\nReturn JSON ONLY. Start with '{' and end with '}'.",
+            generation_config=gen_cfg,
+        )
+        if not data.get("cached"):
+            _sleep()
+        parts = parse_multi_part_response(data["text"])
+        if not parts.get("json"):
+            parts["json"] = {"_parse_error": True}
+
+    # --- synthesize Markdown when model returns JSON-only ---
+    if not parts.get("markdown") and isinstance(parts.get("json"), dict):
+        j = parts["json"] or {}
+        print(j)
+        basics = j.get("basics", {}) or {}
+        name = basics.get("name") or "Candidate"
+        email = basics.get("email") or ""
+        phone = basics.get("phone") or ""
+        headline = basics.get("summary") or ""
+
+        # collect skills (strings + dict.keywords/name), dedupe
+        skills = []
+        for s in (j.get("skills") or []):
+            if isinstance(s, dict):
+                if s.get("name"):
+                    skills.append(s["name"])
+                skills.extend(s.get("keywords") or [])
+            elif isinstance(s, str):
+                skills.append(s)
+        seen = set();
+        skills_norm = []
+        for s in skills:
+            k = s.strip().lower()
+            if k and k not in seen:
+                seen.add(k);
+                skills_norm.append(s.strip())
+        skills_norm = skills_norm[:15]
+
+        # build a compact, human-readable resume markdown
+        md = []
+        md.append(f"# {name}")
+        contact = " · ".join([p for p in [email, phone] if p])
+        if contact:
+            md.append(contact)
+        if headline:
+            md.append(f"\n**Summary:** {headline}")
+        if skills_norm:
+            md.append("\n**Skills:** " + ", ".join(skills_norm))
+
+        for w in (j.get("work") or [])[:2]:
+            if not isinstance(w, dict):
+                continue
+            pos = w.get("position") or ""
+            org = w.get("name") or ""
+            loc = (w.get("location") or "") or ""
+            start = w.get("startDate") or ""
+            end = w.get("endDate") or "present"
+            dates = "–".join([x for x in [start, end] if x])
+            header = " ".join([t for t in [pos and f"**{pos}**,", org] if t]).strip()
+            if header:
+                md.append(f"\n{header} ({loc}) — {dates}".strip())
+            for h in (w.get("highlights") or [])[:4]:
+                md.append(f"- {h}")
+
+        parts["markdown"] = "\n".join(md).strip()
+
+    return parts
 
 
 def run_recruiter_agent_json(job_description: str, cv_text: str, judge_id: str = "judge-0",
@@ -177,7 +406,7 @@ def run_recruiter_agent_json(job_description: str, cv_text: str, judge_id: str =
         "overall": 0-1
       }
     """
-    model = _model()
+    model = _model("recruiter")
     prompt_template = load_prompt("src/prompts/recruiter_agent_prompt.txt")
 
     # judge persona / strictness (affects rubric)
@@ -208,27 +437,42 @@ def run_recruiter_agent_json(job_description: str, cv_text: str, judge_id: str =
     seed_token = rng.randint(1000, 9999)
     persona_hint += f"\n- calibration_token: {seed_token}"
     vars_dict = {"job_description": job_description, "cv_text": cv_text}
-    prompt = safe_curly_format(prompt_template, vars_dict) + persona_hint + contract
+    prompt = safe_curly_format(prompt_template, vars_dict) + "\n\n[ACTIVE MODE] A" + persona_hint + contract
 
     gen_cfg = GenerationConfig(
-        temperature=0.35 + 0.25 * rng.random(),  # 0.35–0.60
+        temperature=0.25 + 0.20 * rng.random(),  # 0.35–0.60
         top_p=0.9,
         top_k=50,
         candidate_count=1,
-        max_output_tokens=1024,
+        max_output_tokens=7000
     )
-
-    resp = model.generate_content(prompt, generation_config=gen_cfg)
-    _sleep()
+    gen_cfg_dict = {
+        "temperature": float(gen_cfg.temperature),
+        "top_p": float(gen_cfg.top_p),
+        "top_k": int(gen_cfg.top_k),
+        "response_mime_type": "application/json",  # # JSON-only mode (ignored by older SDKs)
+        "candidate_count": int(gen_cfg.candidate_count),
+        "max_output_tokens": int(gen_cfg.max_output_tokens)
+    }
+    _print_prompt_tokens(model, prompt, "recruiter_agent")
+    print(f"[cfg recruiter_single] max_output_tokens={gen_cfg_dict['max_output_tokens']}")
+    data = call_with_cache(model, prompt, generation_config=gen_cfg_dict)
+    if not data.get("cached"): _sleep()
 
     # Try to parse JSON directly; fallback to extracting first valid JSON object
-    txt = resp.text.strip()
+    txt = data["text"].strip()
     try:
         js = json.loads(txt)
     except Exception:
         # Fallback: find first JSON object
-        m = re.search(r"\{.*\}", txt, re.DOTALL)
+        m = re.search(r'\[[\s\S]*\]|\{[\s\S]*\}', txt)  # first JSON object/array
         js = json.loads(m.group(0)) if m else {"subscores": {}, "overall": 0.0}
+
+    # ---- SHAPE GUARD: if model slipped an ARRAY for single, take first ----
+    if isinstance(js, list):
+        js = js[0] if js else {"subscores": {}, "overall": 0.0}
+    elif not isinstance(js, dict):
+        js = {"subscores": {}, "overall": 0.0}
 
     # Normalize ranges/keys
     subs = js.get("subscores", {})
@@ -255,7 +499,93 @@ def run_recruiter_agent_json(job_description: str, cv_text: str, judge_id: str =
     }
 
 
-# -----------------------------
+def run_recruiter_committee_once(job_description: str, cv_text: str, profiles: list[dict], jd_json: Any) -> list[dict]:
+    model = _model("recruiter")
+    tmpl = load_prompt("src/prompts/recruiter_agent_prompt.txt")
+
+    # Build orthogonal judge profiles: weights + views + calibration tokens
+    prof_lines = []
+    for i, p in enumerate(profiles):
+        w = p.get("weights", {
+            "must_have_coverage": 0.20, "impact_evidence": 0.15, "recency_seniority": 0.10,
+            "tech_depth": 0.20, "ats_readability": 0.10, "realism": 0.25
+        })
+        # Build judge-specific JD views
+        musts = _to_dict({"m": job_description}).get("m")  # job_description already compact
+        jd_full = job_description
+        jd_musts = "Must haves: " + ", ".join(
+            (jd_json.get("must_haves", []) if 'jd_json' in locals() else [])) or jd_full
+        jd_resp = "Top responsibilities: " + "; ".join(
+            (jd_json.get("responsibilities", []) if 'jd_json' in locals() else [])) or jd_full
+
+        views = {"full": jd_full[:3000], "must_haves_only": jd_musts[:1500], "resp_only": jd_resp[:1500]}
+        cal = 1117 + 37 * i  # simple per-judge calibration token
+
+        prof_lines.append(
+            " - judge_id: judge-{i}; style: {label}; strictness: {s}; emphasis: {focus}; "
+            "weights: {w}; view: {view}; calibration_token: {cal}".format(
+                i=i, label=p.get("label", "balanced"), s=p.get("strictness", 1.0),
+                focus=", ".join(p.get("focus", [])) or "none", w=w, view=views, cal=cal
+            ))
+
+    committee_hint = (
+            "\n\n[JUDGE COMMITTEE]\n" + "\n".join(prof_lines) +
+            "\nEach judge must evaluate INDEPENDENTLY using their own weights/view; "
+            "do NOT copy or average other judges' scores."
+            "\nEnforce diversity: the pairwise L1 distance between judges' SUBSCORE vectors "
+            "should be >= 0.06 when evidence permits. If too similar, adjust minimally per profile."
+            "\nReturn an ARRAY of JSON objects (same order)."
+    )
+
+    # Optional: give different JD 'views' per judge (the model still sees all, but is told what to consider)
+    # (keep jd_desc concise)
+    jd_full = job_description
+    vars_dict = {"job_description": jd_full, "cv_text": cv_text}
+    prompt = (safe_curly_format(tmpl, vars_dict)
+              + "\n\n[ACTIVE MODE] B\n[COMMITTEE SIZE] " + str(len(profiles))
+              + committee_hint
+              + "\n\n[OUTPUT CONTRACT]\nReturn a MINIFIED JSON ARRAY of exactly "
+              + str(len(profiles)) + " objects in the specified schema. No prose."
+              )
+
+    gen_cfg_dict = {"temperature": 0.30,
+                    "top_p": 0.9,
+                    "top_k": 50,
+                    "max_output_tokens": 10000,
+                    "response_mime_type": "application/json"  # # JSON-only mode
+                    }
+    _print_prompt_tokens(model, prompt, "recruiter_commitee_agent")
+    data = call_with_cache(model, prompt, generation_config=gen_cfg_dict)
+    txt = data["text"].strip()
+
+    # Parse committee array
+    m = re.search(r"\[.*\]", txt, re.DOTALL)
+    arr = json.loads(m.group(0)) if m else []
+    out = []
+
+    def clamp01(x):
+        try:
+            return max(0.0, min(1.0, float(x)))
+        except:
+            return 0.0
+
+    for obj in arr:
+        subs = obj.get("subscores", {})
+        out.append({
+            "judge_id": obj.get("judge_id", "judge-0"),
+            "subscores": {
+                "must_have_coverage": clamp01(subs.get("must_have_coverage", 0)),
+                "impact_evidence": clamp01(subs.get("impact_evidence", 0)),
+                "recency_seniority": clamp01(subs.get("recency_seniority", 0)),
+                "tech_depth": clamp01(subs.get("tech_depth", 0)),
+                "ats_readability": clamp01(subs.get("ats_readability", 0)),
+                "realism": clamp01(subs.get("realism", 0)),
+            },
+            "overall": clamp01(obj.get("overall", 0))
+        })
+    return out
+
+
 # Epoch-facing API (used by generate_epoch.py)
 # -----------------------------
 def generate_personas(generation: int, n_personas: Optional[int] = None) -> List[Dict[str, Any]]:
@@ -266,7 +596,7 @@ def generate_personas(generation: int, n_personas: Optional[int] = None) -> List
     n = n_personas or int(os.getenv("N_PERSONAS", "20"))
     roles = ["SWE", "Data Scientist", "ML Engineer", "Backend", "Frontend"]
     domains = ["fintech", "ecommerce", "infra", "healthtech", "logistics"]
-    seniorities = ["junior", "mid", "senior"]
+    seniorities = ["junior", "mid", "senior",  "staff", "lead", "principal"]
 
     rng = random.Random(cfg.seed * cfg.generation_prime + generation)  # stable per generation
 
@@ -322,21 +652,35 @@ def generate_jobs(generation: int, n_jobs: Optional[int] = None) -> List[Dict[st
         jd_json["domain"] = jd_json.get("domain") or "general"
         jd_json["id"] = jd_json.get("id") or f"jd-{generation}-{j}"
         jd_json["raw_text"] = jd_md
+        jd_json = _normalize_job_json(jd_json, jd_md)
         jobs.append(jd_json)
     return jobs
 
 
-def tailor_cv(persona: Dict[str, Any], jd: Dict[str, Any]) -> Dict[str, Any]:
+def tailor_cv(persona: Any, jd: Any) -> Dict[str, Any]:
     """
     Calls your candidate agent and converts the response into a CV dict
     that matches the CVDoc schema keys used in generate_epoch.py.
     """
-    job_md = jd.get("raw_text", "")
+    persona = _to_dict(persona)
+    # normalize JD to dict + markdown
+    if isinstance(jd, str):
+        try:
+            jd_json, jd_md = parse_json_md(jd)
+            jd_json["raw_text"] = jd_md
+        except Exception:
+            jd_json = {"raw_text": jd}
+    else:
+        jd_json = _to_dict(jd)
+
+    job_md = jd_json.get("raw_text", "")
     style = persona.get("constraints", {}).get("style_profile", {})
+    title_lc = (jd_json.get("title") or "").lower()
+    is_senior_jd = any(k in title_lc for k in ("senior", "staff", "lead", "principal"))
     candidate_inputs = {
         "persona": persona.get("core_story", ""),
         "job_markdown": job_md,
-        "job_json": json.dumps(jd, ensure_ascii=False),
+        "job_json": json.dumps(jd_json, ensure_ascii=False),
         "generation": persona.get("id", "gen"),
         "mutation_seed": str(uuid.uuid4()),
         "style_profile": style
@@ -344,16 +688,26 @@ def tailor_cv(persona: Dict[str, Any], jd: Dict[str, Any]) -> Dict[str, Any]:
     cv_parts = run_candidate_agent(candidate_inputs)
     cv_md = cv_parts.get("markdown", "")
     cv_json = cv_parts.get("json", {}) or {}
-
+    skills_list = _skills_to_strings(cv_json.get("skills"))
     # Build a schema-friendly CV dict (safe defaults)
+
+    # senior calibration for more competent CV generation
+    if is_senior_jd:
+        # ensure seniority claim and minimum years
+        cv_json["seniority_claim"] = cv_json.get("seniority_claim") or "senior"
+        yrs = cv_json.get("years_experience")
+        if yrs is None or float(yrs) < 5:
+            cv_json["years_experience"] = 5
+    # print(f"CV - JSON \n\n {json.dumps(cv_json, indent=2)}")
     cv = {
         "id": f"cv-{uuid.uuid4().hex[:8]}",
         "persona_id": persona.get("id"),
-        "jd_id": jd.get("id"),
-        "role_claim": cv_json.get("role_claim") or jd.get("title") or persona.get("role_seed", "Unknown"),
+        "jd_id": jd_json.get("id"),
+        "role_claim": cv_json.get("role_claim") or jd_json.get("title") or persona.get("role_seed", "Unknown"),
         "seniority_claim": cv_json.get("seniority_claim") or persona.get("seniority"),
-        "contacts": cv_json.get("contacts") or {"name": None, "email": None, "phone": None, "links": None},
-        "skills": cv_json.get("skills") or [],
+        "years_experience": cv_json.get("years_experience"),
+        "contacts": cv_json.get("contacts") or {"name": cv_json.get("basics", {}).get("name"), "email": cv_json.get("basics", {}).get("email"), "phone": cv_json.get("basics", {}).get("phone"), "links": cv_json.get("basics", {}).get("url")},
+        "skills": skills_list,  # ← normalized here
         "sections": cv_json.get("sections") or [{"header": "Summary", "bullets": [], "evidence": []}],
         "raw_markdown": cv_md,
         "raw_text": _markdown_to_text(cv_md),
@@ -362,91 +716,36 @@ def tailor_cv(persona: Dict[str, Any], jd: Dict[str, Any]) -> Dict[str, Any]:
     return cv
 
 
-def run_recruiter_committee_once(job_description: str, cv_text: str, profiles: list[dict]) -> list[dict]:
-    model = _model()
-    tmpl = load_prompt("src/prompts/recruiter_agent_prompt.txt")
-
-    # Build orthogonal judge profiles: weights + views + calibration tokens
-    prof_lines = []
-    for i, p in enumerate(profiles):
-        w = p.get("weights", {
-            "must_have_coverage": 0.20, "impact_evidence": 0.15, "recency_seniority": 0.10,
-            "tech_depth": 0.20, "ats_readability": 0.10, "realism": 0.25
-        })
-        view = p.get("view", "full")  # "full" | "must_haves_only" | "resp_only"
-        cal = 1117 + 37 * i  # simple per-judge calibration token
-        prof_lines.append(
-            " - judge_id: judge-{i}; style: {label}; strictness: {s}; emphasis: {focus}; "
-            "weights: {w}; view: {view}; calibration_token: {cal}".format(
-                i=i, label=p.get("label", "balanced"), s=p.get("strictness", 1.0),
-                focus=", ".join(p.get("focus", [])) or "none", w=w, view=view, cal=cal
-            ))
-
-    committee_hint = (
-            "\n\n[JUDGE COMMITTEE]\n" + "\n".join(prof_lines) +
-            "\nEach judge must evaluate INDEPENDENTLY using their own weights/view; "
-            "do NOT copy or average other judges' scores."
-            "\nEnforce diversity: the pairwise L1 distance between judges' SUBSCORE vectors "
-            "should be >= 0.06 when evidence permits. If too similar, adjust minimally per profile."
-            "\nReturn an ARRAY of JSON objects (same order)."
-    )
-
-    contract = (
-        "\n\n[OUTPUT CONTRACT]\n"
-        "Return MINIFIED JSON ONLY: "
-        "[{\"judge_id\":\"judge-0\",\"subscores\":{\"must_have_coverage\":0.9,\"impact_evidence\":0.8,"
-        "\"recency_seniority\":0.8,\"tech_depth\":0.7,\"ats_readability\":0.9,\"realism\":0.8},\"overall\":0.85}, ...]"
-        "\nNo prose."
-    )
-
-    # Optional: give different JD 'views' per judge (the model still sees all, but is told what to consider)
-    # (keep jd_desc concise)
-    jd_full = job_description
-    vars_dict = {"job_description": jd_full, "cv_text": cv_text}
-    prompt = safe_curly_format(tmpl, vars_dict) + committee_hint + contract
-
-    from google.generativeai.types import GenerationConfig
-    resp = model.generate_content(prompt, generation_config=GenerationConfig(
-        temperature=0.45, top_p=0.9, top_k=50, max_output_tokens=1024
-    ))
-
-    txt = resp.text.strip()
-    # Parse committee array
-    m = re.search(r"\[.*\]", txt, re.DOTALL)
-    arr = json.loads(m.group(0)) if m else []
-    out = []
-
-    def clamp01(x):
-        try:
-            return max(0.0, min(1.0, float(x)))
-        except:
-            return 0.0
-
-    for obj in arr:
-        subs = obj.get("subscores", {})
-        out.append({
-            "judge_id": obj.get("judge_id", "judge-0"),
-            "subscores": {
-                "must_have_coverage": clamp01(subs.get("must_have_coverage", 0)),
-                "impact_evidence": clamp01(subs.get("impact_evidence", 0)),
-                "recency_seniority": clamp01(subs.get("recency_seniority", 0)),
-                "tech_depth": clamp01(subs.get("tech_depth", 0)),
-                "ats_readability": clamp01(subs.get("ats_readability", 0)),
-                "realism": clamp01(subs.get("realism", 0)),
-            },
-            "overall": clamp01(obj.get("overall", 0))
-        })
-    return out
+# minimal parser for "JSON --- Markdown"
+def parse_json_md(payload: str):
+    s = (payload or "").strip()
+    # drop any dumper headers like "# model: ..."
+    s = "\n".join(line for line in s.splitlines() if not line.startswith("# "))
+    parts = re.split(r'(?m)^\s*---\s*$', s)
+    js = json.loads(re.sub(r"```(?:json|yaml)?|```", "", parts[0], flags=re.I))
+    md = parts[1] if len(parts) > 1 else ""
+    return js, md
 
 
-def score_cv_committee(cv: Dict[str, Any], jd: Dict[str, Any], n_judges: int = 3) -> List[Dict[str, Any]]:
+def score_cv_committee(cv: Any, jd: Any, n_judges: int = 3) -> List[Dict[str, Any]]:
     """
     One-call committee by default. Falls back to single-judge calls only if parsing fails.
     Returns list of {cv_id, jd_id, judge_id, subscores, overall}.
     """
+
+    # normalize JD to dict + markdown
+    if isinstance(jd, str):
+        jd_json, jd_md = parse_json_md(jd)  # raw "JSON --- Markdown"
+        jd_json["raw_text"] = jd_md
+    else:
+        jd_json = _to_dict(jd)  # Pydantic or dict
+        jd_md = jd_json.get("raw_text", "")
+    job_md = jd_md or jd_json.get("raw_text", "")
+    cv = _to_dict(cv)
+
     # Token-diet JD for speed
-    musts = jd.get("must_haves", [])[:8]
-    resp = jd.get("responsibilities", [])[:5]
+    musts = jd_json.get("must_haves", [])[:8]
+    resp = jd_json.get("responsibilities", [])[:5]
     jd_desc = "Must haves: " + ", ".join(musts)
     if resp:
         jd_desc += "\nTop responsibilities: " + "; ".join(resp)
@@ -473,15 +772,25 @@ def score_cv_committee(cv: Dict[str, Any], jd: Dict[str, Any], n_judges: int = 3
                ][:n_judges]
 
     # === One-call committee ===
-    committee = run_recruiter_committee_once(jd_desc, cv_text, profiles)
+    committee = run_recruiter_committee_once(jd_desc, cv_text, profiles, jd_json)
 
     # If parsing failed or empty, fall back to per-judge calls (rare)
     if not committee or len(committee) < n_judges:
+        # Build orthogonal judge profiles: weights + views + calibration tokens
+        prof_lines = []
         scores = []
         for i, prof in enumerate(profiles):
+            v = prof.get("view", "full")
+            j_id = f"judge-{i}"
+            cal = judge_cal_token(j_id, jd_json.get("id", "jd-unk"), cv.get("id", "cv-unk"), cfg.seed)
+            prof_lines.append(
+                " - judge_id: judge-{i}; style: {label}; strictness: {s}; emphasis: {focus}; weights: {w}; view: {v}; calibration_token: {cal}"
+                .format(i=i, label=prof.get("label", "balanced"), s=prof.get("strictness", 1.0),
+                        focus=", ".join(prof.get("focus", [])) or "none", w=prof.get("weights", {}), v=v, cal=cal)
+            )
             s = run_recruiter_agent_json(jd_desc, cv_text, judge_id=f"judge-{i}", profile=prof)
             scores.append({
-                "cv_id": cv["id"], "jd_id": jd["id"], "judge_id": s["judge_id"],
+                "cv_id": cv["id"], "jd_id": jd_json["id"], "judge_id": s["judge_id"],
                 "subscores": s["subscores"], "overall": float(s["overall"])
             })
         return scores
@@ -491,7 +800,7 @@ def score_cv_committee(cv: Dict[str, Any], jd: Dict[str, Any], n_judges: int = 3
         subs = s["subscores"]
         prof_w = profiles[i]["weights"]  # weights you passed in
         out.append({
-            "cv_id": cv["id"], "jd_id": jd["id"],
+            "cv_id": cv["id"], "jd_id": jd_json["id"],
             "judge_id": s.get("judge_id", f"judge-{i}"),
             "subscores": subs,
             "overall": _weighted_overall(subs, prof_w)
@@ -511,7 +820,68 @@ def _markdown_to_text(md: str) -> str:
     return text.strip()
 
 
+def _extract_list_after_heading(md: str, heading_regex: str) -> list[str]:
+    """
+    Grab bullet list lines immediately after a heading match (until blank line or next heading).
+    """
+    import re
+    m = re.search(heading_regex, md, flags=re.IGNORECASE)
+    if not m: return []
+    tail = md[m.end():]
+    lines = []
+    for line in tail.splitlines():
+        if re.match(r"^\s*#{1,6}\s", line):  # next section
+            break
+        if not line.strip():  # blank block break
+            if lines: break
+            continue
+        if re.match(r"^\s*[-*•]\s+", line):
+            lines.append(re.sub(r"^\s*[-*•]\s+", "", line).strip())
+    return lines
+
+
+def _print_prompt_tokens(model, prompt: str, label: str):
+    try:
+        ct = model.count_tokens(prompt)
+        total = getattr(ct, "total_tokens", None) or ct["total_tokens"]
+        print(f"[tokens] {label}: prompt_total={total}")
+    except Exception as e:
+        print(f"[tokens] {label}: count failed ({e})")
+
+
+def _normalize_job_json(jd_json: dict, jd_md: str) -> dict:
+    # Accept both camelCase and snake_case inside "qualifications"
+    quals = jd_json.get("qualifications") or {}
+    musts = jd_json.get("must_haves") or quals.get("must_haves") or quals.get("mustHave") or []
+    nices = jd_json.get("nice_to_haves") or quals.get("nice_to_haves") or quals.get("niceToHave") or []
+    resps = jd_json.get("responsibilities") or []
+
+    # Last-ditch: mine Markdown sections if lists are still empty
+    if not musts:
+        musts = _extract_list_after_heading(jd_md, r"what you[’']?ll bring.*?\(?.*must.?have.*?\)?\s*$")
+    if not nices:
+        nices = _extract_list_after_heading(jd_md, r"bonus points|nice.?to.?have\s*$")
+    if not resps:
+        resps = _extract_list_after_heading(jd_md, r"what you[’']?ll do|responsibilit(y|ies)\s*$")
+
+    jd_json["must_haves"] = [s for s in (musts or []) if s]
+    jd_json["nice_to_haves"] = [s for s in (nices or []) if s]
+    jd_json["responsibilities"] = [s for s in (resps or []) if s]
+    return jd_json
+
+
 SCORE_KEYS = ["must_have_coverage", "impact_evidence", "recency_seniority", "tech_depth", "ats_readability", "realism"]
+
+def _to_dict(x):
+    if hasattr(x, "model_dump"):
+        return x.model_dump(mode="python")
+    if hasattr(x, "dict"):
+        return x.dict()
+    return dict(x) if isinstance(x, dict) else x  # pass through for strings
+
+def judge_cal_token(judge_id: str, jd_id: str, cv_id: str, seed: int) -> int:
+    s = f"{judge_id}|{jd_id}|{cv_id}|{seed}"
+    return int(hashlib.sha256(s.encode()).hexdigest(), 16) % 9000 + 1000  # 1000–9999
 
 
 def _weighted_overall(subs: dict[str, float], weights: dict[str, float]) -> float:
@@ -520,28 +890,28 @@ def _weighted_overall(subs: dict[str, float], weights: dict[str, float]) -> floa
     return float(sum((weights.get(k, 0.0) / z) * float(subs.get(k, 0.0)) for k in SCORE_KEYS))
 
 
-# Demo run (optional)
-# -----------------------------
-if __name__ == "__main__":
-    # Minimal smoke run (single JD, single persona, single committee)
-    persona = {
-        "id": "persona-demo-0",
-        "core_story": "Data Scientist with 6 years in recommender systems (PyTorch/HF).",
-        "role_seed": "Data Scientist",
-        "seniority": "senior",
-        "domain": "ecommerce",
-        "skills_seed": ["Python", "PyTorch", "SQL"],
-        "constraints": {}
-    }
-
-    jd = generate_jobs(generation=0, n_jobs=1)[0]
-    cv = tailor_cv(persona, jd)
-    scores = score_cv_committee(cv, jd, n_judges=3)
-
-    print("\n=== JD (markdown head) ===")
-    print(jd.get("raw_text", "")[:2000],
-          "...\n")  # prints only the first 400 characters and then literally appends an ellipsis.
-    print("=== CV (markdown head) ===")
-    print(cv.get("raw_markdown", "")[:2000], "...\n")
-    print("=== Committee scores ===")
-    print(json.dumps(scores, indent=2))
+# # Demo run (optional)
+# # -----------------------------
+# if __name__ == "__main__":
+#     # Minimal smoke run (single JD, single persona, single committee)
+#     persona = {
+#         "id": "persona-demo-0",
+#         "core_story": "Data Scientist with 6 years in recommender systems (PyTorch/HF).",
+#         "role_seed": "Data Scientist",
+#         "seniority": "senior",
+#         "domain": "ecommerce",
+#         "skills_seed": ["Python", "PyTorch", "SQL"],
+#         "constraints": {}
+#     }
+#
+#     jd = generate_jobs(generation=0, n_jobs=1)[0]
+#     cv = tailor_cv(persona, jd)
+#     scores = score_cv_committee(cv, jd, n_judges=3)
+#
+#     print("\n=== JD (markdown head) ===")
+#     print(jd.get("raw_text", "")[:2000],
+#           "...\n")  # prints only the first 400 characters and then literally appends an ellipsis.
+#     print("=== CV (markdown head) ===")
+#     print(cv.get("raw_markdown", "")[:2000], "...\n")
+#     print("=== Committee scores ===")
+#     print(json.dumps(scores, indent=2))

@@ -1,2 +1,15 @@
 seed: 42
 generation_prime: 10007   # for per-generation RNG isolation
+retrieval:
+  top_k: 5          # default k
+
+fitness:
+  novelty_coeff: 0.10  # λ_novel
+  # subscore_weights: {}       # optional; e.g., {"tech_depth": 2.0, ...}
+  # penalty_weights: {}        # optional; e.g., {"dup_similarity": 1.5, ...}
+
+dedup:
+  backend: auto     # auto | datasketch | builtin
+  lsh_threshold: 0.85
+  shingle_k: 5
+  num_perm: 128

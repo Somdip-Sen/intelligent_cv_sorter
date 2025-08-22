@@ -13,17 +13,10 @@ dependencies:
   - pydantic
   - protobuf
   - numpy
-
+  - mlflow
+  - datasketch
+  - yaml
   # --- Pip Packages ---
   # Use pip for packages not available on conda channels or for the latest versions
   - pip:
     - google-generativeai
-
-protobuf
-python-dotenv
-numpy
-mlflow
-datasketch
-yaml
-pyyaml
-pydantic
