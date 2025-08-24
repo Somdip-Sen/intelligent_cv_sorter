@@ -24,6 +24,8 @@ set_seed(cfg.seed)  # your existing helper
 MAX_WORKERS = int(os.getenv("GENAI_MAX_CONCURRENCY", "8"))
 
 
+
+
 def run_generation(output_dir: str, generation: int, top_k: float = 0.20):
     set_seed(cfg.seed)
     out = Path(output_dir)
@@ -124,13 +126,19 @@ def run_generation(output_dir: str, generation: int, top_k: float = 0.20):
         mlflow.log_metric("n_personas", len(personas))
         mlflow.log_metric("n_jobs", len(jobs))
         mlflow.log_metric("n_cv", len(samples))
-        mlflow.log_metric(
-            "dup_rate",
-            sum(float(r.meta["novelty"]) < 0.5 for _, r in records) / len(records)
-        )
-        mlflow.log_metric("parallel_errors", errors)
         if records:
-            mlflow.log_metric("fitness_p95", sorted([f for f, _ in records])[-max(1, int(0.05 * len(records)))])
+            mlflow.log_metric(
+                "dup_rate",
+                sum(float(r.meta["novelty"]) < 0.5 for _, r in records) / len(records)
+            )
+            mlflow.log_metric(
+                "fitness_p95",
+                sorted([f for f, _ in records])[-max(1, int(0.05 * len(records)))]
+            )
+        if cl1:
+            mlflow.log_metric("committee_l1_mean", mean(cl1))
+        mlflow.log_metric("parse_fail_rate", parse_fail_rate)
+        mlflow.log_metric("parallel_errors", errors)
         if cl1:
             mlflow.log_metric("committee_l1_mean", mean(cl1))  # diversity of judges’ views (higher = less agreement).
         mlflow.log_metric("parse_fail_rate",
