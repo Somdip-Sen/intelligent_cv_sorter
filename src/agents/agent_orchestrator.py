@@ -59,9 +59,60 @@ job_model = mk_model("GEMINI_MODEL_JOB", "gemini-1.5-flash")
 candidate_model = mk_model("GEMINI_MODEL_CANDIDATE", "gemini-1.5-flash")
 recruiter_model = mk_model("GEMINI_MODEL_RECRUITER", "gemini-1.5-pro")
 
-
 # Utilities
 # -----------------------------
+
+# Indian context ====
+IND_FIRST = ["Aarav", "Vihaan", "Vivaan", "Aditya", "Arjun", "Kabir", "Rohit", "Rahul", "Siddharth", "Pranav", "Rajat",
+             "Abhinav", "Karthik", "Manish", "Aakash", "Harsh", "Ishaan", "Yash", "Rakesh", "Sumit", "Vikram", "Nikhil",
+             "Rohan", "Ankit", "Saurabh", "Amit", "Varun", "Deepak", "Sandeep"]
+IND_LAST = ["Sharma", "Verma", "Gupta", "Patel", "Reddy", "Iyer", "Menon", "Naidu", "Rao", "Singh", "Kumar", "Das",
+            "Mukherjee", "Chatterjee", "Nair", "Shah", "Mehta", "Agarwal", "Bansal", "Ghosh", "Chowdhury", "Mishra",
+            "Tripathi", "Pandey", "Yadav", "Jain", "Kulkarni", "Shetty", "Pillai"]
+IND_EMAIL_DOMAINS = ["gmail.com", "outlook.com", "yahoo.co.in", "proton.me", "zoho.in"]
+
+_used_names, _used_phones, _used_emails = set(), set(), set()
+
+
+def _rand_indian_name(rng):
+    return f"{rng.choice(IND_FIRST)} {rng.choice(IND_LAST)}"
+
+
+def _rand_indian_phone(rng):
+    start = rng.choice(["6", "7", "8", "9"])
+    return "+91" + start + "".join(str(rng.randint(0, 9)) for _ in range(9))
+
+
+def _rand_indian_email(name, rng):
+    base = name.lower().replace(" ", ".")
+    dom = rng.choice(IND_EMAIL_DOMAINS)
+    suffix = str(rng.randint(11, 99))
+    return f"{base}{suffix}@{dom}"
+
+
+def ensure_india_pii(cv: dict, seed: int):
+    rng = random.Random(seed ^ hash(cv.get("id", "")))
+    # name
+    name = (((cv.get("contacts") or {}).get("name")) or "").strip()
+    if not name or name in _used_names or " " not in name or name.split()[0] in ["Alex", "John", "Jane", "Michael"]:
+        name = _rand_indian_name(rng)
+        _used_names.add(name)
+    # phone
+    phone = (((cv.get("contacts") or {}).get("phone")) or "").strip()
+    if not phone or not phone.startswith("+91") or len(re.sub(r"\D", "", phone)) != 12:
+        phone = _rand_indian_phone(rng)
+    # email
+    email = (((cv.get("contacts") or {}).get("email")) or "").strip()
+    if not email or ".in" not in email and email.endswith((".com", ".me", ".co")):
+        email = _rand_indian_email(name, rng)
+
+    links = (cv.get("contacts") or {}).get("links") or []
+    cv["contacts"] = {"name": name, "email": email, "phone": phone, "links": links}
+    return cv
+
+
+# ============
+
 def load_prompt(file_path: str) -> str:
     try:
         with open(file_path, "r", encoding="utf-8") as f:
@@ -261,7 +312,7 @@ def run_job_agent(job_details: Dict[str, Any]) -> Dict[str, Any]:
     prompt = safe_curly_format(prompt_template, defaults)
     gen_cfg = {"temperature": 0.50, "top_p": 0.9, "top_k": 48,
                # "response_mime_type": "application/json",  # # JSON-only mode (ignored by older SDKs)
-               "max_output_tokens": int(os.getenv("MAX_OUTPUT_TOKENS", '5000'))}
+               "max_output_tokens": int(os.getenv("MAX_OUTPUT_TOKENS", '8000'))}
     _print_prompt_tokens(model, prompt, "job_agent")
     data = call_with_cache(model, prompt, generation_config=gen_cfg)  # cache key = (MODEL, prompt)
     if not data.get("cached"):
@@ -295,8 +346,8 @@ def run_candidate_agent(candidate_inputs: Dict[str, Any]) -> Dict[str, Any]:
     defaults = {
         "persona": "", "job_markdown": "", "job_json": "null",
         "recruiter_feedback": "null", "generation": 1, "mutation_seed": "null",
-        "max_pages": 1, "locale": "en-US", "salary_expectation": "null",
-        "legal": "", "redact_pii": "true"
+        "max_pages": 1, "locale": "en-IN", "salary_expectation": "null",
+        "legal": "", "redact_pii": "false", "region_hint": "India"
     }
     defaults.update(candidate_inputs)
     prompt = safe_curly_format(prompt_template, defaults)
@@ -308,7 +359,7 @@ def run_candidate_agent(candidate_inputs: Dict[str, Any]) -> Dict[str, Any]:
         "temperature": 0.45 + 0.20 * rng.random(),  # 0.45–0.65
         "top_p": 0.9, "top_k": 48,
         # "response_mime_type": "application/json",  # # JSON-only mode (ignored by older SDKs)
-        "max_output_tokens": 9000,
+        "max_output_tokens": 11000,
         "stop_sequences": ["\n## END"]
     }
     _print_prompt_tokens(model, prompt, "candidate_agent")
@@ -444,7 +495,7 @@ def run_recruiter_agent_json(job_description: str, cv_text: str, judge_id: str =
         top_p=0.9,
         top_k=50,
         candidate_count=1,
-        max_output_tokens=7000
+        max_output_tokens=12000
     )
     gen_cfg_dict = {
         "temperature": float(gen_cfg.temperature),
@@ -551,7 +602,7 @@ def run_recruiter_committee_once(job_description: str, cv_text: str, profiles: l
     gen_cfg_dict = {"temperature": 0.30,
                     "top_p": 0.9,
                     "top_k": 50,
-                    "max_output_tokens": 10000,
+                    "max_output_tokens": 13000,
                     "response_mime_type": "application/json"  # # JSON-only mode
                     }
     _print_prompt_tokens(model, prompt, "recruiter_commitee_agent")
@@ -596,7 +647,7 @@ def generate_personas(generation: int, n_personas: Optional[int] = None) -> List
     n = n_personas or int(os.getenv("N_PERSONAS", "20"))
     roles = ["SWE", "Data Scientist", "ML Engineer", "Backend", "Frontend"]
     domains = ["fintech", "ecommerce", "infra", "healthtech", "logistics"]
-    seniorities = ["junior", "mid", "senior",  "staff", "lead", "principal"]
+    seniorities = ["junior", "mid", "senior", "staff", "lead", "principal"]
 
     rng = random.Random(cfg.seed * cfg.generation_prime + generation)  # stable per generation
 
@@ -625,13 +676,14 @@ def generate_jobs(generation: int, n_jobs: Optional[int] = None) -> List[Dict[st
     """
     k = n_jobs or int(os.getenv("N_JOBS", "5"))
     # Minimal job_details; you can extend via env/config
+    modes = ["Hybrid (India)", "Remote (India)", "WFH (India)"]
     base = {
-        "role_concept": "Software/ML roles across domains",
+        "role_concept": "Software/ML roles in Indian market across domains",
         "seniority": "Mixed",
-        "location_mode": "Remote",
         "employment_type": "Full-time",
     }
     jobs = []
+    base = {**base, "location_mode": random.choice(modes)}
     for j in range(k):
         jd_parts = run_job_agent(base)
         jd_json_raw = jd_parts.get("json") or {}
@@ -653,6 +705,21 @@ def generate_jobs(generation: int, n_jobs: Optional[int] = None) -> List[Dict[st
         jd_json["id"] = jd_json.get("id") or f"jd-{generation}-{j}"
         jd_json["raw_text"] = jd_md
         jd_json = _normalize_job_json(jd_json, jd_md)
+
+        # Make JDs Indian if the model slips
+        jd_json.setdefault("salaryCurrency", "INR")
+        jd_json.setdefault("applicantLocationRequirements", ["India"])
+        if not jd_json.get("jobLocationType"):
+            jd_json["jobLocationType"] = "HYBRID"
+        if not jd_json.get("jobLocation"):
+            city = random.choice(["Kolkata", "Bengaluru", "Hyderabad", "Pune", "Gurgaon", "Noida", "Chennai", "Mumbai"])
+            jd_json["jobLocation"] = [
+                {"@type": "Place",
+                 "address": {"@type": "PostalAddress", "addressLocality": city, "addressCountry": "IN"}}]
+        # Optional simple hint in MD if currency not present
+        if "₹" not in (jd_json.get("raw_text") or ""):
+            jd_json["raw_text"] = (jd_json.get("raw_text") or "") + "\n\n_Compensation shown/paid in INR (₹, LPA)._"
+
         jobs.append(jd_json)
     return jobs
 
@@ -706,13 +773,17 @@ def tailor_cv(persona: Any, jd: Any) -> Dict[str, Any]:
         "role_claim": cv_json.get("role_claim") or jd_json.get("title") or persona.get("role_seed", "Unknown"),
         "seniority_claim": cv_json.get("seniority_claim") or persona.get("seniority"),
         "years_experience": cv_json.get("years_experience"),
-        "contacts": cv_json.get("contacts") or {"name": cv_json.get("basics", {}).get("name"), "email": cv_json.get("basics", {}).get("email"), "phone": cv_json.get("basics", {}).get("phone"), "links": cv_json.get("basics", {}).get("url")},
+        "contacts": cv_json.get("contacts") or {"name": cv_json.get("basics", {}).get("name"),
+                                                "email": cv_json.get("basics", {}).get("email"),
+                                                "phone": cv_json.get("basics", {}).get("phone"),
+                                                "links": cv_json.get("basics", {}).get("url")},
         "skills": skills_list,  # ← normalized here
         "sections": cv_json.get("sections") or [{"header": "Summary", "bullets": [], "evidence": []}],
         "raw_markdown": cv_md,
         "raw_text": _markdown_to_text(cv_md),
         "render_pdf_path": None
     }
+    cv = ensure_india_pii(cv, cfg.seed)
     return cv
 
 
@@ -872,12 +943,14 @@ def _normalize_job_json(jd_json: dict, jd_md: str) -> dict:
 
 SCORE_KEYS = ["must_have_coverage", "impact_evidence", "recency_seniority", "tech_depth", "ats_readability", "realism"]
 
+
 def _to_dict(x):
     if hasattr(x, "model_dump"):
         return x.model_dump(mode="python")
     if hasattr(x, "dict"):
         return x.dict()
     return dict(x) if isinstance(x, dict) else x  # pass through for strings
+
 
 def judge_cal_token(judge_id: str, jd_id: str, cv_id: str, seed: int) -> int:
     s = f"{judge_id}|{jd_id}|{cv_id}|{seed}"
@@ -888,7 +961,6 @@ def _weighted_overall(subs: dict[str, float], weights: dict[str, float]) -> floa
     # normalize weights in case they don’t sum to 1.0
     z = sum(weights.get(k, 0.0) for k in SCORE_KEYS) or 1.0
     return float(sum((weights.get(k, 0.0) / z) * float(subs.get(k, 0.0)) for k in SCORE_KEYS))
-
 
 # # Demo run (optional)
 # # -----------------------------
