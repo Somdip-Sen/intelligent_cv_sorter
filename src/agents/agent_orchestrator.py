@@ -33,7 +33,6 @@ from src.utils.cache import call_with_cache, debug_dump
 from src.post.india_bank import IndiaBank
 from src.post.india_enforce import enforce_india_cv, enforce_india_jd
 
-
 cfg = load_cfg()  # or load_cfg(cli_seed=args.seed)
 set_seed(cfg.seed)  # your existing helper
 
@@ -48,7 +47,8 @@ genai.configure(api_key=API_KEY)
 MODEL_NAME = os.getenv("GEMINI_MODEL", "models/gemini-1.5-flash-latest")
 RPM_SLEEP_SEC = float(os.getenv("GENAI_RPM_SLEEP", "1.1"))  # throttle safety
 
-BANK = IndiaBank("data/india_bank.yaml", p_invent=float(os.getenv("INDIA_P_INVENT","0.15")), seed=cfg.seed)
+BANK = IndiaBank("data/india_bank.yaml", p_invent=float(os.getenv("INDIA_P_INVENT", "0.15")), seed=cfg.seed)
+
 
 def mk_model(env_var: str, default_name: str):
     name = os.getenv(env_var, default_name)
@@ -93,27 +93,6 @@ def _rand_indian_email(name, rng):
     dom = rng.choice(IND_EMAIL_DOMAINS)
     suffix = str(rng.randint(11, 99))
     return f"{base}{suffix}@{dom}"
-
-
-def ensure_india_pii(cv: dict, seed: int):
-    rng = random.Random(seed ^ hash(cv.get("id", "")))
-    # name
-    name = (((cv.get("contacts") or {}).get("name")) or "").strip()
-    if not name or name in _used_names or " " not in name or name.split()[0] in ["Alex", "John", "Jane", "Michael"]:
-        name = _rand_indian_name(rng)
-        _used_names.add(name)
-    # phone
-    phone = (((cv.get("contacts") or {}).get("phone")) or "").strip()
-    if not phone or not phone.startswith("+91") or len(re.sub(r"\D", "", phone)) != 12:
-        phone = _rand_indian_phone(rng)
-    # email
-    email = (((cv.get("contacts") or {}).get("email")) or "").strip()
-    if not email or ".in" not in email and email.endswith((".com", ".me", ".co")):
-        email = _rand_indian_email(name, rng)
-
-    links = (cv.get("contacts") or {}).get("links") or []
-    cv["contacts"] = {"name": name, "email": email, "phone": phone, "links": links}
-    return cv
 
 
 # ============
@@ -574,14 +553,24 @@ def run_recruiter_committee_once(job_description: str, cv_text: str, profiles: l
         jd_resp = "Top responsibilities: " + "; ".join(
             (jd_json.get("responsibilities", []) if 'jd_json' in locals() else [])) or jd_full
 
+        required_view = p.get("view", "full")  # <- use the judge’s requested view; fallback only if missing
         views = {"full": jd_full[:3000], "must_haves_only": jd_musts[:1500], "resp_only": jd_resp[:1500]}
+        view_txt = views.get(required_view, jd_full)  # <- the actual JD slice text for that view
+
         cal = 1117 + 37 * i  # simple per-judge calibration token
 
         prof_lines.append(
             " - judge_id: judge-{i}; style: {label}; strictness: {s}; emphasis: {focus}; "
-            "weights: {w}; view: {view}; calibration_token: {cal}".format(
-                i=i, label=p.get("label", "balanced"), s=p.get("strictness", 1.0),
-                focus=", ".join(p.get("focus", [])) or "none", w=w, view=views, cal=cal
+            "weights: {w}; view: {required_view}; calibration_token: {cal}\n"
+            "   [JD VIEW TEXT]\n{view_txt}\n".format(
+                i=i,
+                label=p.get("label", "balanced"),
+                s=p.get("strictness", 1.0),
+                focus=", ".join(p.get("focus", [])) or "none",
+                w=w,
+                required_view=required_view,  # <- just the label: "full" | "must_haves_only" | "resp_only"
+                cal=cal,
+                view_txt=view_txt  # <- the concrete slice the judge should read
             ))
 
     committee_hint = (
@@ -688,9 +677,10 @@ def generate_jobs(generation: int, n_jobs: Optional[int] = None) -> List[Dict[st
         "employment_type": "Full-time",
     }
     jobs = []
-    base = {**base, "location_mode": random.choice(modes)}
+
     for j in range(k):
-        jd_parts = run_job_agent(base)
+        base_with_random_mode = {**base, "location_mode": random.choice(modes)}
+        jd_parts = run_job_agent(base_with_random_mode)
         jd_json_raw = jd_parts.get("json") or {}
         jd_json: dict[str, Any] = dict(jd_json_raw)  # ensure built-in dict
         jd_md = jd_parts.get("markdown", "")
@@ -711,23 +701,28 @@ def generate_jobs(generation: int, n_jobs: Optional[int] = None) -> List[Dict[st
         jd_json["raw_text"] = jd_md
         jd_json = _normalize_job_json(jd_json, jd_md)
 
-        # Make JDs Indian if the model slips
+        # --- Indianization + placeholder resolution---
+        # Hard defaults only when missing
         jd_json.setdefault("salaryCurrency", "INR")
         jd_json.setdefault("applicantLocationRequirements", ["India"])
         if not jd_json.get("jobLocationType"):
             jd_json["jobLocationType"] = "HYBRID"
         if not jd_json.get("jobLocation"):
             city = random.choice(["Kolkata", "Bengaluru", "Hyderabad", "Pune", "Gurgaon", "Noida", "Chennai", "Mumbai"])
-            jd_json["jobLocation"] = [
-                {"@type": "Place",
-                 "address": {"@type": "PostalAddress", "addressLocality": city, "addressCountry": "IN"}}]
-        # Optional simple hint in MD if currency not present
+            jd_json["jobLocation"] = [{
+                "@type": "Place",
+                "address": {"@type": "PostalAddress", "addressLocality": city, "addressCountry": "IN"}
+            }]
+
+        # Ensure MD mentions INR once
         if "₹" not in (jd_json.get("raw_text") or ""):
             jd_json["raw_text"] = (jd_json.get("raw_text") or "") + "\n\n_Compensation shown/paid in INR (₹, LPA)._"
 
-        title = (jd_json.get("title") or "").lower()
-        senior_hint = "senior" if any(k in title for k in ("senior", "staff", "lead", "principal")) else "mid"
+        # Call the enforcer ONCE (handles placeholders in JSON, lists, and Markdown)
+        title_lc = (jd_json.get("title") or "").lower()
+        senior_hint = "senior" if any(k in title_lc for k in ("senior", "staff", "lead", "principal")) else "mid"
         jd_json = enforce_india_jd(jd_json, BANK, senior_hint=senior_hint)
+
         jobs.append(jd_json)
     return jobs
 
@@ -774,6 +769,16 @@ def tailor_cv(persona: Any, jd: Any) -> Dict[str, Any]:
         if yrs is None or float(yrs) < 5:
             cv_json["years_experience"] = 5
     # print(f"CV - JSON \n\n {json.dumps(cv_json, indent=2)}")
+
+    contacts_src = cv_json.get("contacts") or {}
+    basic_url = (cv_json.get("basics", {}) or {}).get("url")
+    contacts = {
+        "name": contacts_src.get("name") or (cv_json.get("basics", {}) or {}).get("name"),
+        "email": contacts_src.get("email") or (cv_json.get("basics", {}) or {}).get("email"),
+        "phone": contacts_src.get("phone") or (cv_json.get("basics", {}) or {}).get("phone"),
+        "links": _link_str(contacts_src.get("links") or basic_url),
+    }
+
     cv = {
         "id": f"cv-{uuid.uuid4().hex[:8]}",
         "persona_id": persona.get("id"),
@@ -781,20 +786,19 @@ def tailor_cv(persona: Any, jd: Any) -> Dict[str, Any]:
         "role_claim": cv_json.get("role_claim") or jd_json.get("title") or persona.get("role_seed", "Unknown"),
         "seniority_claim": cv_json.get("seniority_claim") or persona.get("seniority"),
         "years_experience": cv_json.get("years_experience"),
-        "contacts": cv_json.get("contacts") or {"name": cv_json.get("basics", {}).get("name"),
-                                                "email": cv_json.get("basics", {}).get("email"),
-                                                "phone": cv_json.get("basics", {}).get("phone"),
-                                                "links": cv_json.get("basics", {}).get("url")},
+        "contacts": contacts,
         "skills": skills_list,  # ← normalized here
         "sections": cv_json.get("sections") or [{"header": "Summary", "bullets": [], "evidence": []}],
         "raw_markdown": cv_md,
         "raw_text": _markdown_to_text(cv_md),
         "render_pdf_path": None
     }
-    cv = ensure_india_pii(cv, cfg.seed)
+
+    # Compute seniority hint FROM THE JD TITLE once
     title_lc = (jd_json.get("title") or "").lower()
     senior_hint = "senior" if any(k in title_lc for k in ("senior", "staff", "lead", "principal")) else "mid"
-    cv = enforce_india_cv(cv, BANK, senior_hint=senior_hint)
+    # Enforce India context & resolve placeholders ONCE (this also normalizes contacts + links to string)
+    cv = enforce_india_cv(cv, BANK, senior_hint=senior_hint)  # <-- then replace placeholders, INR, cities, etc.
     return cv
 
 
@@ -902,6 +906,26 @@ def _markdown_to_text(md: str) -> str:
     return text.strip()
 
 
+def _link_str(x) -> str:
+    """Normalize links to a single string for CVDoc.contacts.links."""
+    if not x:
+        return ""
+    if isinstance(x, str):
+        return x.strip()
+    if isinstance(x, list):
+        for v in x:
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+        return ""
+    if isinstance(x, dict):
+        for k in ("linkedin", "github", "portfolio", "url", "site"):
+            v = x.get(k)
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+        return ""
+    return str(x).strip()
+
+
 def _extract_list_after_heading(md: str, heading_regex: str) -> list[str]:
     """
     Grab bullet list lines immediately after a heading match (until blank line or next heading).
@@ -972,29 +996,3 @@ def _weighted_overall(subs: dict[str, float], weights: dict[str, float]) -> floa
     # normalize weights in case they don’t sum to 1.0
     z = sum(weights.get(k, 0.0) for k in SCORE_KEYS) or 1.0
     return float(sum((weights.get(k, 0.0) / z) * float(subs.get(k, 0.0)) for k in SCORE_KEYS))
-
-# # Demo run (optional)
-# # -----------------------------
-# if __name__ == "__main__":
-#     # Minimal smoke run (single JD, single persona, single committee)
-#     persona = {
-#         "id": "persona-demo-0",
-#         "core_story": "Data Scientist with 6 years in recommender systems (PyTorch/HF).",
-#         "role_seed": "Data Scientist",
-#         "seniority": "senior",
-#         "domain": "ecommerce",
-#         "skills_seed": ["Python", "PyTorch", "SQL"],
-#         "constraints": {}
-#     }
-#
-#     jd = generate_jobs(generation=0, n_jobs=1)[0]
-#     cv = tailor_cv(persona, jd)
-#     scores = score_cv_committee(cv, jd, n_judges=3)
-#
-#     print("\n=== JD (markdown head) ===")
-#     print(jd.get("raw_text", "")[:2000],
-#           "...\n")  # prints only the first 400 characters and then literally appends an ellipsis.
-#     print("=== CV (markdown head) ===")
-#     print(cv.get("raw_markdown", "")[:2000], "...\n")
-#     print("=== Committee scores ===")
-#     print(json.dumps(scores, indent=2))
