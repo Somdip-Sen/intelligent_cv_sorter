@@ -13,3 +13,4 @@ dedup:
   lsh_threshold: 0.85
   shingle_k: 5
   num_perm: 128
+  INDIA_P_INVENT: 0.05  # probability to invent out-of-bank values (e.g., 0.1–0.20).

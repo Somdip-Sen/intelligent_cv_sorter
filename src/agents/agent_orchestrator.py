@@ -30,6 +30,10 @@ from src.config.settings import load_cfg
 from src.utils.run_ctx import set_seed
 from src.utils.cache import call_with_cache, debug_dump
 
+from src.post.india_bank import IndiaBank
+from src.post.india_enforce import enforce_india_cv, enforce_india_jd
+
+
 cfg = load_cfg()  # or load_cfg(cli_seed=args.seed)
 set_seed(cfg.seed)  # your existing helper
 
@@ -44,6 +48,7 @@ genai.configure(api_key=API_KEY)
 MODEL_NAME = os.getenv("GEMINI_MODEL", "models/gemini-1.5-flash-latest")
 RPM_SLEEP_SEC = float(os.getenv("GENAI_RPM_SLEEP", "1.1"))  # throttle safety
 
+BANK = IndiaBank("data/india_bank.yaml", p_invent=float(os.getenv("INDIA_P_INVENT","0.15")), seed=cfg.seed)
 
 def mk_model(env_var: str, default_name: str):
     name = os.getenv(env_var, default_name)
@@ -720,6 +725,9 @@ def generate_jobs(generation: int, n_jobs: Optional[int] = None) -> List[Dict[st
         if "₹" not in (jd_json.get("raw_text") or ""):
             jd_json["raw_text"] = (jd_json.get("raw_text") or "") + "\n\n_Compensation shown/paid in INR (₹, LPA)._"
 
+        title = (jd_json.get("title") or "").lower()
+        senior_hint = "senior" if any(k in title for k in ("senior", "staff", "lead", "principal")) else "mid"
+        jd_json = enforce_india_jd(jd_json, BANK, senior_hint=senior_hint)
         jobs.append(jd_json)
     return jobs
 
@@ -784,6 +792,9 @@ def tailor_cv(persona: Any, jd: Any) -> Dict[str, Any]:
         "render_pdf_path": None
     }
     cv = ensure_india_pii(cv, cfg.seed)
+    title_lc = (jd_json.get("title") or "").lower()
+    senior_hint = "senior" if any(k in title_lc for k in ("senior", "staff", "lead", "principal")) else "mid"
+    cv = enforce_india_cv(cv, BANK, senior_hint=senior_hint)
     return cv
 
 
