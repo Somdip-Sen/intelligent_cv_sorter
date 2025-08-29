@@ -141,12 +141,15 @@ def enforce_india_jd(jd: dict, bank: IndiaBank, senior_hint: str | None = None) 
     # Hard defaults
     jd["salaryCurrency"] = "INR"
     if not jd.get("jobLocationType"): jd["jobLocationType"] = "HYBRID"
+    # Ensure location (if missing)
     if not jd.get("jobLocation"):
-        city = bank.sample_city();
+        city = phmap.get("CITY1") if 'phmap' in locals() else bank.sample_city()
         state = bank.sample_state(city)
-        jd["jobLocation"] = [{"@type": "Place",
-                              "address": {"@type": "PostalAddress", "addressLocality": city, "addressRegion": state,
-                                          "addressCountry": "IN"}}]
+        jd["jobLocation"] = [{
+            "@type": "Place",
+            "address": {"@type": "PostalAddress", "addressLocality": city,
+                        "addressRegion": state, "addressCountry": "IN"}
+        }]
 
     # Derive simple 'location' string if missing
     if not jd.get("location"):
@@ -163,19 +166,18 @@ def enforce_india_jd(jd: dict, bank: IndiaBank, senior_hint: str | None = None) 
     # Remove college tails from must_haves and trailing "from"
     mh = [s for s in (jd.get("must_haves") or []) if s]
     clean = []
-    for s in mh:
-        # drop " from <anything>" or dangling "from"
-        s = re.sub(r"\s+from\s+.*$", "", s.strip())
-        s = re.sub(r"\s+from\s*$", "", s)
-        clean.append(s)
-    jd["must_haves"] = [s for s in clean if s]
+    for s in jd.get("must_haves", []) or []:
+        s = re.sub(r"\s+from\s+[^.;\n]+$", "", s).strip()
+        if s:
+            clean.append(s)
+    jd["must_haves"] = clean
 
     # Ensure salary hint + keep ₹ in MD
     lo, hi = bank.sample_salary_lpa((senior_hint or "mid").lower())
     jd["salary_hint"] = jd.get("salary_hint") or f"{lo}-{hi} LPA"
 
     md = bank.strip_non_indian_tokens(jd.get("raw_text") or "")
-    if "₹" not in md:
+    if "₹" not in md and "LPA" not in md:
         md += f"\n\nCompensation: ₹{lo}–₹{hi} LPA (INR)."
     jd["raw_text"] = md
 
