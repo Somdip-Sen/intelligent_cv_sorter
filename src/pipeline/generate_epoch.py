@@ -1,6 +1,7 @@
 # Run CLI -> python -m src.pipeline.generate_epoch --output data/synth/raw --generation 0
 # or with Env override -> APP_SEED=123 APP_GENERATION_PRIME=10009 python -m src.pipeline.generate_epoch --output data/synth/raw --generation 0
 import os
+import random
 from typing import List, Tuple
 from pathlib import Path
 import json, uuid
@@ -24,13 +25,13 @@ set_seed(cfg.seed)  # your existing helper
 MAX_WORKERS = int(os.getenv("GENAI_MAX_CONCURRENCY", "8"))
 
 
-
-
 def run_generation(output_dir: str, generation: int, top_k: float = 0.20):
     set_seed(cfg.seed)
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
     personas = [Persona.model_validate(p) for p in generate_personas(generation)]
+    rng = random.Random(cfg.seed * 10 + generation)
+    rng.shuffle(personas)
     jobs = [JobJD.model_validate(j) for j in generate_jobs(generation)]
 
     ## serial code ----
@@ -135,14 +136,17 @@ def run_generation(output_dir: str, generation: int, top_k: float = 0.20):
                 "fitness_p95",
                 sorted([f for f, _ in records])[-max(1, int(0.05 * len(records)))]
             )
-        if cl1:
-            mlflow.log_metric("committee_l1_mean", mean(cl1))
-        mlflow.log_metric("parse_fail_rate", parse_fail_rate)
-        mlflow.log_metric("parallel_errors", errors)
+        else:
+            mlflow.log_metric("dup_rate", 0.0)
+            mlflow.log_metric("fitness_p95", 0.0)
+
         if cl1:
             mlflow.log_metric("committee_l1_mean", mean(cl1))  # diversity of judges’ views (higher = less agreement).
+        else:
+            mlflow.log_metric("committee_l1_mean", 0.0)
         mlflow.log_metric("parse_fail_rate",
                           parse_fail_rate)  # rough health check (you can refine later if you add try/except around parsing).
+        mlflow.log_metric("parallel_errors", errors)
 
 
 if __name__ == "__main__":

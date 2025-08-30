@@ -770,14 +770,16 @@ def tailor_cv(persona: Any, jd: Any) -> Dict[str, Any]:
             cv_json["years_experience"] = 5
     # print(f"CV - JSON \n\n {json.dumps(cv_json, indent=2)}")
 
-    contacts_src = cv_json.get("contacts") or {}
-    basic_url = (cv_json.get("basics", {}) or {}).get("url")
-    contacts = {
-        "name": contacts_src.get("name") or (cv_json.get("basics", {}) or {}).get("name"),
-        "email": contacts_src.get("email") or (cv_json.get("basics", {}) or {}).get("email"),
-        "phone": contacts_src.get("phone") or (cv_json.get("basics", {}) or {}).get("phone"),
-        "links": _link_str(contacts_src.get("links") or basic_url),
-    }
+    contacts_dict = cv_json.get("contacts") or cv_json.get("basics") or {}
+    name = (contacts_dict.get("name") or "").strip()
+    email = (contacts_dict.get("email") or "").strip()
+    phone = (contacts_dict.get("phone") or "").strip()
+    links = contacts_dict.get("url") or cv_json.get("url") or ""
+    # If the LLM emitted a list of links, collapse to first string
+    if isinstance(links, list):
+        links = next((x for x in links if isinstance(x, str) and x.strip()), "")
+
+    contacts = {"name": name, "email": email, "phone": phone, "links": links}
 
     cv = {
         "id": f"cv-{uuid.uuid4().hex[:8]}",
