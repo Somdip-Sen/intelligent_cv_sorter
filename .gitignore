@@ -68,7 +68,7 @@ dist/
 # Large datasets (raw or processed)
 # It's best practice to keep large datasets out of Git. Use data versioning
 # tools like DVC or store them on cloud storage.
-data/
+data/synth/*
 dataset/
 *.csv
 *.tsv
