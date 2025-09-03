@@ -3,19 +3,22 @@ from typing import Any, Tuple
 from .india_bank import IndiaBank
 
 # Recognize both location and PII placeholders.
-# Examples: [[CITY1]], [[STATE2]], [[PIN]], [[FULL_NAME]], [[EMAIL]], [[PHONE]], [[LINKEDIN_PROFILE]]
-_PH_RE = re.compile(r"\[\[(CITY|STATE|COLLEGE|PIN|FULL_NAME|EMAIL|PHONE|LINKEDIN_PROFILE)(\d+)?\]\]")
-
+# Also allow URL-style ones people often type: [[LINKEDIN_URL]], [[GITHUB_URL]].
+_PH_RE = re.compile(
+    r"\[\[(CITY|STATE|COLLEGE|PIN|FULL_NAME|EMAIL|PHONE|LINKEDIN_PROFILE|LINKEDIN_URL|GITHUB_URL|GITHUB_HANDLE|PORTFOLIO_URL|WEBSITE)(\d+)?\]\]",
+    re.I,
+)
 
 def replace_placeholders_text(
-        text: str,
-        bank: IndiaBank,
-        mapping: dict[str, str] | None = None,
-        _PH_RE=None
+    text: str,
+    bank: IndiaBank,
+    mapping: dict[str, str] | None = None,
+    _PH_RE=_PH_RE,
 ) -> Tuple[str, dict[str, str]]:
     """
-    Replace [[CITY1]], [[STATE1]], [[COLLEGE1]], [[PIN1]] and PII [[FULL_NAME1]], [[EMAIL1]], [[PHONE1]], [[LINKEDIN_PROFILE1]]
-    in a string. Returns (new_text, mapping) where mapping holds all resolved tokens for consistency.
+    Replace [[CITY1]], [[STATE1]], [[COLLEGE1]], [[PIN1]] and PII [[FULL_NAME1]], [[EMAIL1]], [[PHONE1]],
+    [[LINKEDIN_PROFILE1]] plus URL variants [[LINKEDIN_URL]], [[GITHUB_URL]], [[GITHUB_HANDLE]], [[PORTFOLIO_URL]], [[WEBSITE]].
+    Returns (new_text, mapping) where mapping holds all resolved tokens for consistency.
     - Keeps a stable mapping so the same token (e.g., CITY1) resolves consistently everywhere.
     - Derives STATEi and PINi from CITYi when available; PINi uses (CITYi, STATEi) if present.
     """
@@ -43,33 +46,47 @@ def replace_placeholders_text(
         if key in mapping:
             return mapping[key]
 
-        if tag == "CITY":
+        # LOCATION
+        if tag.upper() == "CITY":
             v = bank.sample_city()
             mapping[key] = v
             _ensure_derived(idx)
-        elif tag == "STATE":
+        elif tag.upper() == "STATE":
             v = bank.sample_state(mapping.get(_k("CITY", idx)))
             mapping[key] = v
             _ensure_derived(idx)
-        elif tag == "COLLEGE":
+        elif tag.upper() == "COLLEGE":
             v = bank.sample_college()
             mapping[key] = v
-        elif tag == "PIN":
+        elif tag.upper() == "PIN":
             v = bank.sample_pin(mapping.get(_k("CITY", idx)), mapping.get(_k("STATE", idx)))
             mapping[key] = v
-        elif tag == "FULL_NAME":
+
+        # PII
+        elif tag.upper() == "FULL_NAME":
             v = bank.sample_name()
             mapping[key] = v
-        elif tag == "EMAIL":
+        elif tag.upper() == "EMAIL":
             name = mapping.get(_k("FULL_NAME", idx)) or bank.sample_name()
             v = bank.sample_email(name)
             mapping[key] = v
-        elif tag == "PHONE":
+        elif tag.upper() == "PHONE":
             v = bank.sample_phone()
             mapping[key] = v
-        elif tag == "LINKEDIN_PROFILE":
+        elif tag.upper() in ("LINKEDIN_PROFILE", "LINKEDIN_URL"):
             name = mapping.get(_k("FULL_NAME", idx)) or bank.sample_name()
-            v = bank.sample_linkedin(name)
+            v = bank.sample_linkedin(name)  # returns a full https URL
+            mapping[key] = v
+        elif tag.upper() == "GITHUB_URL":
+            name = mapping.get(_k("FULL_NAME", idx)) or bank.sample_name()
+            v = bank.sample_github(name)  # full https URL
+            mapping[key] = v
+        elif tag.upper() == "GITHUB_HANDLE":
+            name = mapping.get(_k("FULL_NAME", idx)) or bank.sample_name()
+            v = bank.github_handle(name)   # just the handle
+            mapping[key] = v
+        elif tag.upper() in ("PORTFOLIO_URL", "WEBSITE"):
+            v = bank.sample_portfolio()
             mapping[key] = v
         else:
             v = ""
@@ -80,14 +97,16 @@ def replace_placeholders_text(
         return _value(m.group(1), m.group(2))
 
     new_text = _PH_RE.sub(_repl, text)
+    # repair accidental scheme duplication like "https://https://..."
+    new_text = re.sub(r"https?://https?://", "https://", new_text)
     return new_text, mapping
 
 
 def replace_placeholders_json(
-        obj: Any,
-        bank: IndiaBank,
-        mapping: dict[str, str] | None = None,
-        _PH_RE=_PH_RE
+    obj: Any,
+    bank: IndiaBank,
+    mapping: dict[str, str] | None = None,
+    _PH_RE=_PH_RE,
 ) -> tuple[Any, dict[str, str]]:
     """
     Recursively replace placeholders anywhere in a JSON-like structure.

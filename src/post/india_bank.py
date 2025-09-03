@@ -1,3 +1,5 @@
+import itertools
+
 import yaml, random, threading, re
 from pathlib import Path
 
@@ -15,62 +17,6 @@ def _flatten_list_maybe_hyphen(rows):
         else:
             out.append(row)
     return out
-
-
-# Lightweight maps for state/pin inference for realism.
-_CITY_TO_STATE = {
-    # core
-    "Ahmedabad": "Gujarat",
-    "Bengaluru": "Karnataka",
-    "Chennai": "Tamil Nadu",
-    "Gurgaon": "Haryana",
-    "Hyderabad": "Telangana",
-    "Kolkata": "West Bengal",
-    "Mumbai": "Maharashtra",
-    "New Delhi": "Delhi",
-    "Noida": "Uttar Pradesh",
-    "Pune": "Maharashtra",
-    # a few common extras
-    "Jaipur": "Rajasthan",
-    "Lucknow": "Uttar Pradesh",
-    "Indore": "Madhya Pradesh",
-    "Chandigarh": "Chandigarh",
-    "Nagpur": "Maharashtra",
-    "Coimbatore": "Tamil Nadu",
-    "Surat": "Gujarat",
-    "Varanasi": "Uttar Pradesh",
-    "Visakhapatnam": "Andhra Pradesh",
-    "Bhopal": "Madhya Pradesh",
-    "Vadodara": "Gujarat",
-    "Mysore": "Karnataka",
-    "Thane": "Maharashtra",
-    "Kochi": "Kerala",
-    "Patna": "Bihar",
-    "Ranchi": "Jharkhand",
-}
-
-
-# Typical city/state PIN prefixes (rough, not exhaustive)
-_STATE_PIN_PREFIX = {
-    "Delhi": [110],
-    "Maharashtra": [400, 401, 402, 403, 411, 412],
-    "Karnataka": [560, 561, 562],
-    "Tamil Nadu": [600, 601, 602],
-    "Telangana": [500, 501, 502],
-    "Gujarat": [380, 382, 390, 395],
-    "West Bengal": [700, 701],
-    "Uttar Pradesh": [201, 202, 226, 247, 281],
-    "Rajasthan": [302, 303, 311],
-    "Madhya Pradesh": [452, 462, 474],
-    "Andhra Pradesh": [520, 530, 531],
-    "Kerala": [670, 680, 682],
-    "Bihar": [800, 801],
-    "Haryana": [120, 121, 122, 124],
-    "Jharkhand": [834, 829],
-    "Chandigarh": [160],
-}
-
-_COMMON_STATES = list(_STATE_PIN_PREFIX.keys())
 
 
 class IndiaBank:
@@ -94,6 +40,12 @@ class IndiaBank:
     def _ascii(self, s: str) -> str:
         return s.encode("ascii", "ignore").decode("ascii")
 
+    def _slug(self, name: str) -> str:
+        s = re.sub(r"[^a-z0-9]+", "", name.lower())
+        if not s:
+            s = "user"
+        return s
+
     # ----- name -----
     def _invent_name(self):
         f = "".join(self.rng.choices(self.data["invent_syllables_first"], k=self.rng.randint(1, 2)))
@@ -108,10 +60,21 @@ class IndiaBank:
             name = self._invent_name()
         else:
             first_pool = _flatten_list_maybe_hyphen(self.data["first_names"])
+            middle_pool = _flatten_list_maybe_hyphen(self.data["middle_names"])
             last_pool = _flatten_list_maybe_hyphen(self.data["last_names"])
             first = self.rng.choice(first_pool).split()[0]
+            middle = self.rng.choice(middle_pool).split()[0]
             last = self.rng.choice(last_pool).split()[0]
-            name = f"{first} {last}"
+            if random.random() < 0.9:
+                # This type of name has a 90% chance of being executed
+                name = f"{first} {last}"
+            else:
+                # This block has a 10% chance of being executed
+                if middle is None:
+                    # Fallback if middle name is not available
+                    name = f"{first} {last}"
+                else:
+                    name = f"{first}{middle}{last}"
         with self._lock:
             while name in self._used["names"]:
                 name = self._invent_name()
@@ -119,7 +82,6 @@ class IndiaBank:
         return name
 
         # ----- phone -----
-
     def sample_phone(self):
         def mk():
             start = self.rng.choice(["6", "7", "8", "9"])
@@ -133,26 +95,33 @@ class IndiaBank:
         return ph
 
         # ----- email -----
-
-    def _weighted_domain(self):
-        domains = _flatten_list_maybe_hyphen(self.data.get("email_domains", []))
-        if not domains:
-            return "gmail.com"
-        # 70% gmail/outlook, 30% others
-        if self.rng.random() < 0.7:
-            for pref in ("gmail.com", "outlook.com"):
-                if pref in domains:
-                    return pref
-            # fallback if not present
-        return self.rng.choice(domains)
+    def choose_email_domain(self) -> str:
+        # Prefer gmail/outlook > others; fall back to YAML list if present
+        pool = self.data.get("email_domains") or ["gmail.com", "outlook.com", "yahoo.co.in", "proton.me", "zoho.in"]
+        # weights (sum to 1.0). Align by names if present; otherwise uniform.
+        fixed_pref = {
+            "gmail.com": 0.75,
+            "outlook.com": 0.15
+        }
+        fixed_domain_keys = set(fixed_pref.keys())
+        other_domains = sorted(
+            [d for d in set(pool) if d not in fixed_domain_keys])  # Use set(pool) to handle duplicates
+        remaining_prob = 1.0 - sum(fixed_pref.values())
+        prob_per_other = 0
+        final_domains = list(fixed_pref.keys()) + other_domains
+        final_weights = list(fixed_pref.values()) + [prob_per_other] * len(other_domains)
+        r = self.rng.random()
+        cumulative_weights = itertools.accumulate(final_weights)
+        for domain, cum_weight in zip(final_domains, cumulative_weights):
+            # The running sum ensures we correctly map the random float `r` to a bucket.
+            if r <= cum_weight:
+                return domain
+            # This fallback handles potential floating-point inaccuracies or an empty pool.
+        return pool[-1] if pool else "gmail.com"
 
     def sample_email(self, name: str):
         base = name.lower().replace(" ", ".")
-        # bias towards gmail/outlook
-        domains = self.data.get("email_domains") or ["gmail.com", "outlook.com", "yahoo.co.in", "proton.me", "zoho.in"]
-        weighted = (["gmail.com"] * 5) + (["outlook.com"] * 3) + [d for d in domains if
-                                                                  d not in {"gmail.com", "outlook.com"}]
-        dom = self.rng.choice(weighted)
+        dom = self.choose_email_domain()
         with self._lock:
             em = f"{base}{self.rng.randint(11, 99)}@{dom}"
             while em in self._used["emails"]:
@@ -161,82 +130,80 @@ class IndiaBank:
         return em
 
         # ----- city -----
-
     def sample_city(self):
         # More frequency on core cities (extras only if _coin() triggers)
         pool = self.data["cities_extra"] if self._coin() else self.data["cities_core"]
         return self.rng.choice(pool)
 
         # ----- company -----
-
-    def _invent_company(self):
-        stem = self.rng.choice(self.data["invent_syllables_last"]).capitalize()
-        suf = self.rng.choice(self.data["company_suffixes"])
-        return f"{stem} {suf}"
-
     def sample_company(self):
-        if self._coin():
-            return self._invent_company()
-        return self.rng.choice(self.data["companies_curated"])
+        self.rng.choice(self.data["companies_curated"])
 
         # ----- salary (LPA) -----
-
     def sample_salary_lpa(self, seniority: str = "mid"):
         lo, hi = self.data["salary_lpa_by_seniority"].get(seniority, self.data["salary_lpa_by_seniority"]["mid"])
         low = int(lo + 0.1 * (hi - lo) * self.rng.random())
         high = int(hi - 0.1 * (hi - lo) * self.rng.random())
-        if high <= low: high = low + 1
+        if high <= low:
+            high = low + 1
         return low, high
 
         # ----- college -----
-
     def sample_college(self):
-        pools = []
-        for k in ("colleges_tier1", "colleges_core", "colleges_tier2", "colleges_extra"):
-            if isinstance(self.data.get(k), list):
-                pools.extend(self.data[k])
-        if not pools:
-            pools = ["IIT Bombay", "IIT Delhi", "IIT Madras", "IIT Guwahati", "IISc Bengaluru", "NIT Trichy",
+        # flatten tiered lists gracefully
+        tiers = []
+        for k in ("colleges_tier1", "colleges_tier2", "colleges_tier3"):
+            tiers.extend(self.data.get(k) or [])
+        if not tiers:
+            tiers = ["IIT Bombay", "IIT Delhi", "IIT Madras", "IIT Guwahati", "IISc Bengaluru", "NIT Trichy",
                      "BITS Pilani"]
-        return self.rng.choice(pools)
+        return self.rng.choice(tiers)
 
     # ----- state -----
     def sample_state(self, city: str | None = None):
-        # prefer explicit mapping if provided in YAML; else random state
-        def sample_state(self, city: str | None = None):
-            m = self.data.get("state_by_city") or {}
-            if city and city in m:
-                return m[city]
-            states = self.data.get("states") or [
-                "Karnataka", "Maharashtra", "Tamil Nadu", "Telangana", "Delhi", "Haryana",
-                "Uttar Pradesh", "Gujarat", "West Bengal", "Rajasthan", "Kerala", "Madhya Pradesh"
-            ]
-            return self.rng.choice(states)
+        # prefer explicit mapping if provided in YAML; else lightweight defaults to random state
+        m = self.data.get("city_to_state") or {}
+        states = self.data.get("states") or [
+            "Karnataka", "Maharashtra", "Delhi", "Tamil Nadu", "Telangana", "Uttar Pradesh",
+            "Gujarat", "West Bengal", "Rajasthan", "Haryana", "Punjab", "Kerala"
+        ]
+        if city and city in m:
+            return m[city]
+        return self.rng.choice(states)
 
         # ----- pin -----
-
     def sample_pin(self, city: str | None = None, state: str | None = None):
-        pins_by_state = self.data.get("pins_by_state") or {}
-        if state and state in pins_by_state and pins_by_state[state]:
-            return str(self.rng.choice(pins_by_state[state]))
-        # plausible fallback: 110xxx / 400xxx / 560xxx etc
-        head = self.rng.choice([110, 400, 500, 560, 600, 700, 800])
-        tail = self.rng.randint(100, 999)
-        return f"{head}{tail:03d}"
+        by_city = self.data.get("pins_by_city") or {}
+        if city and city in by_city:
+            return str(self.rng.choice(by_city[city]))
+        # simple synthetic fallback
+        return str(self.rng.randint(100000, 799999))
+
+        # --------github ------------
+    def github_handle(self, name: str) -> str:
+        base = self._slug(name)
+        return f"{base}{self.rng.randint(11, 99)}"
+
+    def sample_github(self, name: str) -> str:
+        return f"https://github.com/{self.github_handle(name)}"
 
     # ----- LinkedIn -----
     def sample_linkedin(self, name: str):
-        slug = self._ascii(name.lower().replace(" ", "-"))
-        return f"linkedin.com/in/{slug}{self.rng.randint(10, 99)}"
+        slug = self._slug(name)
+        return f"https://linkedin.com/in/{slug}{self.rng.randint(11, 99)}"
 
-        # ----- sanitize -----
+    def sample_portfolio(self) -> str:
+        # toy portfolio generator; could source from YAML if provided
+        stem = self._slug(self.rng.choice(self.data.get("invent_syllables_last") or ["tech", "data", "code", "cloud"]))
+        tld = self.rng.choice(["in", "dev", "io", "app"])
+        return f"https://www.{stem}{self.rng.randint(11, 99)}.{tld}"
 
+    # ----- sanitize -----
     def strip_non_indian_tokens(self, s: str):
         # DO NOT strip to ASCII; keep ₹ and friends.
         if not s:
             return s
+        s = self._ascii(s)
         for t in ("USD", "$", "401k", "401(k)", "Social Security", "ZIP", "EEO (US)"):
             s = s.replace(t, "")
-        # Normalize spacing that earlier ASCII-pass used to disturb
-        s = re.sub(r"\s{2,}", " ", s)
         return s
