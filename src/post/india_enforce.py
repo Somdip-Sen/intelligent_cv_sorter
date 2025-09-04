@@ -2,183 +2,168 @@ import re
 from .india_bank import IndiaBank
 from .placeholders import replace_placeholders_text, replace_placeholders_json
 
-_PH_RE = re.compile(r"\[\[(CITY|STATE|COLLEGE|PIN)(\d+)?\]\]")
+_PH_RE = re.compile(r"\[\[(CITY|STATE|COLLEGE|PIN|FULL_NAME|EMAIL|PHONE|LINKEDIN_PROFILE|LINKEDIN_URL|GITHUB_URL|GITHUB_HANDLE|PORTFOLIO_URL|WEBSITE)(\d+)?\]\]", re.I)
 
-_TITLE_TOKENS = {"data scientist", "software engineer", "ml engineer", "backend", "frontend",
-                 "full stack", "senior", "lead", "principal", "compensation", "benefits", "specialist"}
-
-
-def _looks_like_title(x: str | None) -> bool:
-    if not x: return True
-    s = str(x).strip().lower()
-    return (len(s) < 3) or (s in _TITLE_TOKENS) or ("engineer" in s) or ("scientist" in s)
-
+def _has_placeholders(s: str) -> bool:
+    return bool(s and _PH_RE.search(s))
 
 def _is_placeholder_contact(v: object) -> bool:
     if v is None: return True
-    s = str(v).strip().lower()
+    s = str(v or "").strip().lower()
     return (
-            s in {"[your name]", "[your.email@example.com]", "[your phone number]", "email", "phone", "linkedin"} or
-            s.startswith("[[") or s.endswith("]]") or
-            ("example.com" in s) or
-            ("yourprofile" in s) or
-            ("xxxxxxxxxx" in s) or
-            ("xxxx" in s) or
-            (not "@" in s and any(tok in s for tok in ("email", "mail")))  # emails without '@'
+        not s or
+        s in {"[your name]","[your email]","[your phone number]","your name","candidate","candidate name"} or
+        s in {"name","email","phone"} or
+        s.startswith("[") and s.endswith("]")
     )
 
+def _is_placeholder_link(s: str | None) -> bool:
+    if not s: return True
+    t = s.strip().lower()
+    return (
+        "yourprofile" in t or
+        "[[" in t or "]]" in t or
+        t in {"linkedin","github","portfolio","website"} or
+        t.endswith("@example.com")
+    )
 
-def _normalize_link_string(links) -> str:
-    # Schema wants a single string. Prefer LinkedIn if present.
-    def norm_one(u: str) -> str:
-        u = u.strip()
-        if not u: return ""
-        if not u.startswith("http"):
-            u = "https://" + u
-        return u
+def _normalize_link(s: str | None) -> str:
+    if not s: return ""
+    s = s.strip()
+    # collapse double schemes
+    s = re.sub(r"https?://https?://", "https://", s)
+    # add scheme if missing and looks like a domain path
+    if re.match(r"^([a-z0-9-]+\.)+[a-z]{2,}(/.*)?$", s, re.I):
+        s = "https://" + s
+    return s
 
-    if isinstance(links, str):
-        return norm_one(links)
-    if isinstance(links, list):
-        if not links: return ""
-        # prefer Linkedin-looking link
-        li = next((l for l in links if "linkedin.com" in str(l).lower()), links[0])
-        return norm_one(str(li))
-    return ""
-
-
-def _replace_contacts_in_text(text: str, name: str, email: str, phone: str, link: str) -> str:
-    if not text: return text
-    repls = [
-        (r"\bemail(?:\.com)?\b", email),
-        (r"\bemail@example\.com\b", email),
-        (r"\byour\.email@example\.com\b", email),
-        (r"\b\+91[- ]?X{10}\b", phone),
-        (r"\bphone\b", phone),
-        (r"\blinked?in(?:\.com)?/in/yourprofile\b", link),
-        (r"\blinked?in\b", link),
-        (r"\[\[FULL_NAME\]\]", name),
-        (r"\bYour Name\b", name),
-    ]
-    out = text
-    for pat, val in repls:
-        out = re.sub(pat, val, out, flags=re.IGNORECASE)
-    return out
-
-
-def _scrub_summary_bullets(sections: list[dict], contacts: dict) -> list[dict]:
-    if not isinstance(sections, list): return []
-    name = (contacts.get("name") or "").strip()
-    email = (contacts.get("email") or "").strip()
-    phone = (contacts.get("phone") or "").strip()
-    new = []
-    for sec in sections:
-        if not isinstance(sec, dict):
-            continue
-        b = []
-        for line in (sec.get("bullets") or []):
-            s = str(line).strip()
-            if not s: continue
-            if s == name or s == email or s == phone:  # drop self-echo
-                continue
-            b.append(s)
-        # if Summary ended up empty, synthesize a single bullet
-        if (sec.get("header", "").lower() == "summary") and not b:
-            b = [f"{name.split()[0]}: Analytical professional with strengths in data analysis and tooling."]
-        new.append({"header": sec.get("header") or "Summary", "bullets": b, "evidence": sec.get("evidence") or []})
-    return new
-
-
-# ---- CV enforcer ----
 def enforce_india_cv(cv: dict, bank: IndiaBank, senior_hint: str | None = None) -> dict:
-    # 1) placeholder replacement first (cities/college/pin)
-    cv, phmap = replace_placeholders_json(cv, bank, _PH_RE=_PH_RE)
-    cv["raw_markdown"], phmap = replace_placeholders_text(cv.get("raw_markdown") or "", bank, phmap, _PH_RE=_PH_RE)
-    cv["raw_text"], _ = replace_placeholders_text(cv.get("raw_text") or "", bank, phmap, _PH_RE=_PH_RE)
+    # 0) CONTACTS — fill if missing or placeholderish
+    contacts = cv.get("contacts") or {}
+    name  = contacts.get("name")
+    email = contacts.get("email")
+    phone = contacts.get("phone")
+    links = contacts.get("links")
 
-    # 2) contacts (PII normalization)
-    c = cv.get("contacts") or {}
-    name = c.get("name");
-    email = c.get("email");
-    phone = c.get("phone");
-    links = c.get("links")
-    if _is_placeholder_contact(name) or _looks_like_title(name):  name = None
+    if _is_placeholder_contact(name):  name = None
     if _is_placeholder_contact(email): email = None
     if _is_placeholder_contact(phone): phone = None
 
-    name = name or bank.sample_name()
+    # links can be string / list / dict / None → normalize to one string
+    link_str = ""
+    if isinstance(links, str):
+        link_str = links
+    elif isinstance(links, list):
+        for v in links:
+            if isinstance(v, str) and v.strip():
+                link_str = v; break
+    elif isinstance(links, dict):
+        for k in ("linkedin","github","portfolio","url","site"):
+            v = links.get(k)
+            if isinstance(v, str) and v.strip():
+                link_str = v; break
+
+    if _is_placeholder_link(link_str):
+        # if we already know (seeded) FULL_NAME, build linkedin from it, else just sample
+        link_str = bank.sample_linkedin(name or bank.sample_name())
+
+    # finally materialize
+    name  = name  or bank.sample_name()
     email = email or bank.sample_email(name)
     phone = phone or bank.sample_phone()
-    link = _normalize_link_string(links) or "https://www.linkedin.com/in/" + name.lower().replace(" ", "")
-    cv["contacts"] = {"name": name, "email": email, "phone": phone, "links": link}  # <-- string, not list
+    link_str = _normalize_link(link_str)
 
-    # 3) rewrite common contact placeholders in MD/Text
-    cv["raw_markdown"] = _replace_contacts_in_text(cv.get("raw_markdown") or "", name, email, phone, link)
-    cv["raw_text"] = _replace_contacts_in_text(cv.get("raw_text") or "", name, email, phone, link)
+    cv["contacts"] = {"name": name, "email": email, "phone": phone, "links": link_str}
 
-    # 4) sanitize non-Indian tokens (keeps ₹ now)
-    cv["raw_markdown"] = bank.strip_non_indian_tokens(cv["raw_markdown"])
-    cv["raw_text"] = bank.strip_non_indian_tokens(cv["raw_text"])
+    # 1) Build a seed map so placeholders across JSON/MD use the SAME values as contacts
+    seed_map = {
+        "FULL_NAME1": name,
+        "EMAIL1": email,
+        "PHONE1": phone,
+        "LINKEDIN_PROFILE1": link_str,
+        "LINKEDIN_URL1": link_str,
+        # handy defaults if someone uses bare CITY/STATE without index
+        "CITY1": None, "STATE1": None, "PIN1": None,
+    }
 
-    # 5) scrub sections (remove name/email/phone bullets; synthesize if empty)
-    cv["sections"] = _scrub_summary_bullets(cv.get("sections") or [], cv["contacts"])
+    # 2) Replace placeholders in sections/raw fields
+    sections, seed_map = replace_placeholders_json(cv.get("sections") or [], bank, seed_map, _PH_RE=_PH_RE)
+    md, seed_map       = replace_placeholders_text(cv.get("raw_markdown") or "", bank, seed_map, _PH_RE=_PH_RE)
+    tx, seed_map       = replace_placeholders_text(cv.get("raw_text") or md, bank, seed_map, _PH_RE=_PH_RE)
 
-    # 6) seniority floor (optional)
+    # sanitize to Indian context (ASCII-safe; we phrase compensation without ₹)
+    md = bank.strip_non_indian_tokens(md)
+    tx = bank.strip_non_indian_tokens(tx)
+
+    # Drop silly bullets that equal the name
+    for sec in sections:
+        if isinstance(sec, dict) and isinstance(sec.get("bullets"), list):
+            sec["bullets"] = [b for b in sec["bullets"] if isinstance(b, str) and b.strip() and b.strip() != name]
+
+    cv["sections"] = sections
+    cv["raw_markdown"] = md
+    cv["raw_text"] = tx
+
+    # 3) Seniority floor (optional)
     if senior_hint:
         years = cv.get("years_experience")
-        if not years or float(years) < 5:
+        try:
+            if not years or float(years) < 5:
+                cv["years_experience"] = 5
+        except Exception:
             cv["years_experience"] = 5
+
+    # Log if anything slips through
+    if _has_placeholders(cv.get("raw_markdown","")) or _has_placeholders(cv.get("raw_text","")):
+        with open("logs/raw/_placeholders_unresolved.log","a",encoding="utf-8") as f:
+            f.write(f"CV {cv.get('id','unknown')} still has placeholders\n")
 
     return cv
 
 
-# ---- JD enforcer ----
 def enforce_india_jd(jd: dict, bank: IndiaBank, senior_hint: str | None = None) -> dict:
-    # Placeholders → values
-    jd, phmap = replace_placeholders_json(jd, bank, _PH_RE=_PH_RE)
-    jd["raw_text"], _ = replace_placeholders_text(jd.get("raw_text") or "", bank, phmap, _PH_RE=_PH_RE)
-
-    # Hard defaults
+    # defaults
     jd["salaryCurrency"] = "INR"
-    if not jd.get("jobLocationType"): jd["jobLocationType"] = "HYBRID"
-    # Ensure location (if missing)
-    if not jd.get("jobLocation"):
-        city = phmap.get("CITY1") if 'phmap' in locals() else bank.sample_city()
+    if not jd.get("jobLocationType"):
+        jd["jobLocationType"] = "HYBRID"
+
+    # location (handle None / wrong types)
+    jl = jd.get("jobLocation")
+    if not jl or not isinstance(jl, list):
+        city = bank.sample_city()
         state = bank.sample_state(city)
         jd["jobLocation"] = [{
             "@type": "Place",
-            "address": {"@type": "PostalAddress", "addressLocality": city,
-                        "addressRegion": state, "addressCountry": "IN"}
+            "address": {"@type": "PostalAddress", "addressLocality": city, "addressRegion": state, "addressCountry": "IN"}
         }]
 
-    # Derive simple 'location' string if missing
-    if not jd.get("location"):
-        try:
-            addr = jd["jobLocation"][0]["address"]
-            jd["location"] = f"{addr.get('addressLocality', '')}, {addr.get('addressRegion', '')}, IN".strip(", ")
-        except Exception:
-            jd["location"] = "India"
+    # unify markdown, then placeholder pass
+    md0 = jd.get("raw_text") or ""
+    md0 = bank.strip_non_indian_tokens(md0)
+    md1, ph = replace_placeholders_text(md0, bank, {}, _PH_RE=_PH_RE)
+    md1 = bank.strip_non_indian_tokens(md1)  # keep ASCII-safe
 
-    # Company stage default (if you don't have a bank list, set a neutral value)
-    if not jd.get("company_stage"):
-        jd["company_stage"] = "growth-stage"
+    # ensure salary hint (avoid ₹ since ASCII)
+    if ("inr" not in md1.lower()) and (jd.get("baseSalary") is None):
+        lo, hi = bank.sample_salary_lpa((senior_hint or "mid").lower())
+        md1 += f"\n\nCompensation: INR {lo}-{hi} LPA."
 
-    # Remove college tails from must_haves and trailing "from"
-    mh = [s for s in (jd.get("must_haves") or []) if s]
-    clean = []
-    for s in jd.get("must_haves", []) or []:
-        s = re.sub(r"\s+from\s+[^.;\n]+$", "", s).strip()
-        if s:
-            clean.append(s)
-    jd["must_haves"] = clean
+    jd["raw_text"] = md1
+    jd["salary_hint"] = jd.get("salary_hint") or f"INR {lo}-{hi} LPA" if "lo" in locals() else None
 
-    # Ensure salary hint + keep ₹ in MD
-    lo, hi = bank.sample_salary_lpa((senior_hint or "mid").lower())
-    jd["salary_hint"] = jd.get("salary_hint") or f"{lo}-{hi} LPA"
+    # Cleanup: remove “ from …” in must_haves
+    mh = jd.get("must_haves") or []
+    cleaned = []
+    for item in mh:
+        if not isinstance(item, str):
+            continue
+        s = re.sub(r"\s+from\s+.*$", "", item.strip(), flags=re.I)
+        if s and s.lower() != "from":
+            cleaned.append(s)
+    jd["must_haves"] = cleaned
 
-    md = bank.strip_non_indian_tokens(jd.get("raw_text") or "")
-    if "₹" not in md and "LPA" not in md:
-        md += f"\n\nCompensation: ₹{lo}–₹{hi} LPA (INR)."
-    jd["raw_text"] = md
+    if _has_placeholders(jd.get("raw_text","")):
+        with open("logs/raw/_placeholders_unresolved.log","a",encoding="utf-8") as f:
+            f.write(f"JD {jd.get('id','unknown')} still has placeholders\n")
 
     return jd
