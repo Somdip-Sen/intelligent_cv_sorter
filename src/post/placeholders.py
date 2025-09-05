@@ -2,37 +2,88 @@ import re
 from typing import Any, Tuple
 from .india_bank import IndiaBank
 
-# Recognize both location and PII placeholders.
-# Also allow URL-style ones people often type: [[LINKEDIN_URL]], [[GITHUB_URL]].
+# Accept a wider set of placeholders (with or without index)
+# e.g. [[CITY]], [[CITY1]], [[LINKEDIN_URL]], [[GITHUB_URL]]
 _PH_RE = re.compile(
-    r"\[\[(CITY|STATE|COLLEGE|PIN|FULL_NAME|EMAIL|PHONE|LINKEDIN_PROFILE|LINKEDIN_URL|GITHUB_URL|GITHUB_HANDLE|PORTFOLIO_URL|WEBSITE)(\d+)?\]\]",
-    re.I,
+    r"\[\[("
+    r"CITY|STATE|COLLEGE|PIN|FULL_NAME|EMAIL|PHONE|"
+    r"LINKEDIN_PROFILE|LINKEDIN_URL|LINKEDIN|GITHUB_URL|GITHUB|WEBSITE_URL|URL"
+    r")(\d+)?\]\]",
+    flags=re.IGNORECASE
 )
+
+# Common dummy/sentinel tokens we should overwrite even if not bracketed
+_COMMON_SENTINELS = [
+    r"\bCandidate Name\b",
+    r"\bFull Name\b",
+    r"\bemail@example\.com\b",
+    r"\bemail\b",
+    r"\+91-?XXXXXXXXXX\b",
+    r"\+91-?9876543210\b",
+    r"\blinkedin\.com/in/yourprofile\b",
+    r"\bcandidatelinkedin\b",
+    r"\bgithub\.com/candidategithub\b",
+    r"https?://\[\[(?:LINKEDIN|LINKEDIN_URL|GITHUB|GITHUB_URL)\]\]",
+    r"\[\[(?:LINKEDIN|LINKEDIN_URL|GITHUB|GITHUB_URL)\]\]"
+]
+_COMMON_SENTINELS_RE = re.compile("|".join(_COMMON_SENTINELS), flags=re.IGNORECASE)
+
+
+def _slugify_name(name: str) -> str:
+    s = re.sub(r"[^a-z0-9]+", "", (name or "").lower())
+    return s or "profile"
+
+
+def _add_scheme(url: str) -> str:
+    if not url:
+        return ""
+    if not re.match(r"^https?://", url, flags=re.I):
+        return "https://" + url.lstrip("/")
+    return url
+
+
+def normalize_links_str(x) -> str:
+    """Normalize links to a single string for CVDoc.contacts.links (Pydantic expects str)."""
+    if not x:
+        return ""
+    if isinstance(x, str):
+        return x.strip()
+    if isinstance(x, list):
+        for v in x:
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+        return ""
+    if isinstance(x, dict):
+        for k in ("linkedin", "github", "portfolio", "url", "site"):
+            v = x.get(k)
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+        return ""
+    return str(x).strip()
+
+
+def _key(tag: str, idx: str | None) -> str:
+    return f"{tag.upper()}{(idx or '1')}"
+
 
 def replace_placeholders_text(
     text: str,
     bank: IndiaBank,
     mapping: dict[str, str] | None = None,
-    _PH_RE=_PH_RE,
+    _PH_RE=_PH_RE
 ) -> Tuple[str, dict[str, str]]:
     """
-    Replace [[CITY1]], [[STATE1]], [[COLLEGE1]], [[PIN1]] and PII [[FULL_NAME1]], [[EMAIL1]], [[PHONE1]],
-    [[LINKEDIN_PROFILE1]] plus URL variants [[LINKEDIN_URL]], [[GITHUB_URL]], [[GITHUB_HANDLE]], [[PORTFOLIO_URL]], [[WEBSITE]].
-    Returns (new_text, mapping) where mapping holds all resolved tokens for consistency.
-    - Keeps a stable mapping so the same token (e.g., CITY1) resolves consistently everywhere.
-    - Derives STATEi and PINi from CITYi when available; PINi uses (CITYi, STATEi) if present.
+    Replace placeholders (location + PII) inside a string and return (new_text, mapping).
+    Keeps a stable mapping so the same token resolves consistently across JSON/MD.
     """
     if not text:
         return text or "", dict(mapping or {})
     mapping = dict(mapping or {})
 
-    def _k(tag: str, idx: str | None) -> str:
-        return f"{tag}{(idx or '1')}"
-
     def _ensure_derived(idx: str | None):
-        k_city = _k("CITY", idx)
-        k_state = _k("STATE", idx)
-        k_pin = _k("PIN", idx)
+        k_city = _key("CITY", idx)
+        k_state = _key("STATE", idx)
+        k_pin = _key("PIN", idx)
         if k_city in mapping and k_state not in mapping:
             mapping[k_state] = bank.sample_state(mapping[k_city])
         if k_pin not in mapping:
@@ -42,63 +93,80 @@ def replace_placeholders_text(
                 mapping[k_pin] = bank.sample_pin(city, state)
 
     def _value(tag: str, idx: str | None) -> str:
-        key = _k(tag, idx)
+        tag = tag.upper()
+        key = _key(tag, idx)
         if key in mapping:
             return mapping[key]
 
-        # LOCATION
-        if tag.upper() == "CITY":
-            v = bank.sample_city()
-            mapping[key] = v
-            _ensure_derived(idx)
-        elif tag.upper() == "STATE":
-            v = bank.sample_state(mapping.get(_k("CITY", idx)))
-            mapping[key] = v
-            _ensure_derived(idx)
-        elif tag.upper() == "COLLEGE":
-            v = bank.sample_college()
-            mapping[key] = v
-        elif tag.upper() == "PIN":
-            v = bank.sample_pin(mapping.get(_k("CITY", idx)), mapping.get(_k("STATE", idx)))
-            mapping[key] = v
-
-        # PII
-        elif tag.upper() == "FULL_NAME":
-            v = bank.sample_name()
-            mapping[key] = v
-        elif tag.upper() == "EMAIL":
-            name = mapping.get(_k("FULL_NAME", idx)) or bank.sample_name()
-            v = bank.sample_email(name)
-            mapping[key] = v
-        elif tag.upper() == "PHONE":
-            v = bank.sample_phone()
-            mapping[key] = v
-        elif tag.upper() in ("LINKEDIN_PROFILE", "LINKEDIN_URL"):
-            name = mapping.get(_k("FULL_NAME", idx)) or bank.sample_name()
-            v = bank.sample_linkedin(name)  # returns a full https URL
-            mapping[key] = v
-        elif tag.upper() == "GITHUB_URL":
-            name = mapping.get(_k("FULL_NAME", idx)) or bank.sample_name()
-            v = bank.sample_github(name)  # full https URL
-            mapping[key] = v
-        elif tag.upper() == "GITHUB_HANDLE":
-            name = mapping.get(_k("FULL_NAME", idx)) or bank.sample_name()
-            v = bank.github_handle(name)   # just the handle
-            mapping[key] = v
-        elif tag.upper() in ("PORTFOLIO_URL", "WEBSITE"):
-            v = bank.sample_portfolio()
-            mapping[key] = v
-        else:
-            v = ""
-            mapping[key] = v
-        return v
+        if tag == "CITY":
+            v = bank.sample_city(); mapping[key] = v; _ensure_derived(idx); return v
+        if tag == "STATE":
+            v = bank.sample_state(mapping.get(_key("CITY", idx))); mapping[key] = v; _ensure_derived(idx); return v
+        if tag == "COLLEGE":
+            v = bank.sample_college(); mapping[key] = v; return v
+        if tag == "PIN":
+            v = bank.sample_pin(mapping.get(_key("CITY", idx)), mapping.get(_key("STATE", idx))); mapping[key] = v; return v
+        if tag == "FULL_NAME":
+            v = bank.sample_name(); mapping[key] = v; return v
+        if tag == "EMAIL":
+            name = mapping.get(_key("FULL_NAME", idx)) or bank.sample_name()
+            v = bank.sample_email(name); mapping[key] = v; return v
+        if tag == "PHONE":
+            v = bank.sample_phone(); mapping[key] = v; return v
+        if tag in ("LINKEDIN_PROFILE", "LINKEDIN_URL", "LINKEDIN", "URL", "WEBSITE_URL"):
+            name = mapping.get(_key("FULL_NAME", idx)) or bank.sample_name()
+            v = bank.sample_linkedin(name); mapping[key] = _add_scheme(v); return mapping[key]
+        if tag in ("GITHUB_URL", "GITHUB"):
+            # Many banks don't have github; synthesize from name
+            name = mapping.get(_key("FULL_NAME", idx)) or bank.sample_name()
+            v = f"https://github.com/{_slugify_name(name)}"
+            mapping[key] = v; return v
+        # default
+        mapping[key] = ""
+        return ""
 
     def _repl(m: re.Match) -> str:
         return _value(m.group(1), m.group(2))
 
+    # Primary replacement
     new_text = _PH_RE.sub(_repl, text)
-    # repair accidental scheme duplication like "https://https://..."
-    new_text = re.sub(r"https?://https?://", "https://", new_text)
+
+    # Also erase common sentinels with actual resolved values
+    if _COMMON_SENTINELS_RE.search(new_text):
+        # Ensure we have a FULL_NAME1/EMAIL1/PHONE1/LINKEDIN_URL1 ready
+        _ = _value("FULL_NAME", None)
+        _ = _value("EMAIL", None)
+        _ = _value("PHONE", None)
+        _ = _value("LINKEDIN_URL", None)
+
+        repls = {
+            r"\bCandidate Name\b": mapping[_key("FULL_NAME", None)],
+            r"\bFull Name\b": mapping[_key("FULL_NAME", None)],
+            r"\bemail@example\.com\b": mapping[_key("EMAIL", None)],
+            r"\bemail\b": mapping[_key("EMAIL", None)],
+            r"\+91-?XXXXXXXXXX\b": mapping[_key("PHONE", None)],
+            r"\+91-?9876543210\b": mapping[_key("PHONE", None)],
+            r"\blinkedin\.com/in/yourprofile\b": mapping[_key("LINKEDIN_URL", None)],
+            r"\bcandidatelinkedin\b": mapping[_key("LINKEDIN_URL", None)],
+            r"\bgithub\.com/candidategithub\b": f"https://github.com/{_slugify_name(mapping[_key('FULL_NAME', None)])}",
+        }
+        for pat, rep in repls.items():
+            new_text = re.sub(pat, rep, new_text, flags=re.IGNORECASE)
+
+        # handle https://[[LINKEDIN_URL]] and bare [[GITHUB_URL]]
+        new_text = re.sub(
+            r"https?://\[\[(?:LINKEDIN|LINKEDIN_URL)\]\]",
+            _add_scheme(mapping[_key("LINKEDIN_URL", None)]),
+            new_text,
+            flags=re.IGNORECASE
+        )
+        new_text = re.sub(
+            r"\[\[(?:GITHUB|GITHUB_URL)\]\]",
+            f"https://github.com/{_slugify_name(mapping[_key('FULL_NAME', None)])}",
+            new_text,
+            flags=re.IGNORECASE
+        )
+
     return new_text, mapping
 
 
@@ -106,7 +174,7 @@ def replace_placeholders_json(
     obj: Any,
     bank: IndiaBank,
     mapping: dict[str, str] | None = None,
-    _PH_RE=_PH_RE,
+    _PH_RE=_PH_RE
 ) -> tuple[Any, dict[str, str]]:
     """
     Recursively replace placeholders anywhere in a JSON-like structure.
@@ -128,3 +196,44 @@ def replace_placeholders_json(
     if isinstance(obj, str):
         return replace_placeholders_text(obj, bank, mapping, _PH_RE=_PH_RE)
     return obj, mapping
+
+
+def canonicalize_contacts(contacts: dict, bank: IndiaBank, mapping: dict[str, str]) -> dict:
+    """Ensure name/email/phone/links are real, consistent with mapping, and links is a single string."""
+    contacts = dict(contacts or {})
+    name = contacts.get("name") or mapping.get("FULL_NAME1") or bank.sample_name()
+    email = contacts.get("email") or mapping.get("EMAIL1") or bank.sample_email(name)
+    phone = contacts.get("phone") or mapping.get("PHONE1") or bank.sample_phone()
+    links_raw = contacts.get("links")
+    basic = normalize_links_str(links_raw)
+    if not basic or _COMMON_SENTINELS_RE.search(basic) or "[[" in basic:
+        basic = mapping.get("LINKEDIN_URL1") or bank.sample_linkedin(name)
+    basic = _add_scheme(basic)
+
+    # Clean obvious sentinels from email too
+    if re.fullmatch(r"email|email@example\.com", str(email), flags=re.I):
+        email = mapping.get("EMAIL1") or bank.sample_email(name)
+
+    return {"name": name, "email": email, "phone": phone, "links": basic}
+
+
+def fix_common_placeholders(s: str, mapping: dict[str, str]) -> str:
+    """Best-effort sweep for leftover dummy tokens in text blocks."""
+    if not s:
+        return s
+    out = s
+    repls = {
+        r"\bCandidate Name\b": mapping.get("FULL_NAME1", ""),
+        r"\bFull Name\b": mapping.get("FULL_NAME1", ""),
+        r"\bemail@example\.com\b": mapping.get("EMAIL1", ""),
+        r"\bemail\b": mapping.get("EMAIL1", ""),
+        r"\+91-?XXXXXXXXXX\b": mapping.get("PHONE1", ""),
+        r"\+91-?9876543210\b": mapping.get("PHONE1", ""),
+        r"\blinkedin\.com/in/yourprofile\b": mapping.get("LINKEDIN_URL1", ""),
+        r"https?://\[\[(?:LINKEDIN|LINKEDIN_URL)\]\]": mapping.get("LINKEDIN_URL1", ""),
+        r"\[\[(?:GITHUB|GITHUB_URL)\]\]": f"https://github.com/{_slugify_name(mapping.get('FULL_NAME1',''))}",
+    }
+    for pat, rep in repls.items():
+        if rep:
+            out = re.sub(pat, rep, out, flags=re.IGNORECASE)
+    return out

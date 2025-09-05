@@ -32,6 +32,7 @@ from src.utils.cache import call_with_cache, debug_dump
 
 from src.post.india_bank import IndiaBank
 from src.post.india_enforce import enforce_india_cv, enforce_india_jd
+from src.post.placeholders import normalize_links_str
 
 cfg = load_cfg()  # or load_cfg(cli_seed=args.seed)
 set_seed(cfg.seed)  # your existing helper
@@ -770,16 +771,14 @@ def tailor_cv(persona: Any, jd: Any) -> Dict[str, Any]:
             cv_json["years_experience"] = 5
     # print(f"CV - JSON \n\n {json.dumps(cv_json, indent=2)}")
 
-    contacts_dict = cv_json.get("contacts") or cv_json.get("basics") or {}
-    name = (contacts_dict.get("name") or "").strip()
-    email = (contacts_dict.get("email") or "").strip()
-    phone = (contacts_dict.get("phone") or "").strip()
-    links = contacts_dict.get("url") or cv_json.get("url") or ""
-    # If the LLM emitted a list of links, collapse to first string
-    if isinstance(links, list):
-        links = next((x for x in links if isinstance(x, str) and x.strip()), "")
-
-    contacts = {"name": name, "email": email, "phone": phone, "links": links}
+    contacts_src = cv_json.get("contacts") or {}
+    basic_url = (cv_json.get("basics", {}) or {}).get("url")
+    contacts = {
+        "name": contacts_src.get("name") or (cv_json.get("basics", {}) or {}).get("name") or "",
+        "email": contacts_src.get("email") or (cv_json.get("basics", {}) or {}).get("email") or "",
+        "phone": contacts_src.get("phone") or (cv_json.get("basics", {}) or {}).get("phone") or "",
+        "links": normalize_links_str(contacts_src.get("links") or basic_url),
+    }
 
     cv = {
         "id": f"cv-{uuid.uuid4().hex[:8]}",
@@ -906,26 +905,6 @@ def _markdown_to_text(md: str) -> str:
     text = re.sub(r"^#{1,6}\s*", "", text, flags=re.MULTILINE)  # headings
     text = re.sub(r"\*\*|\*", "", text)  # bold/italics
     return text.strip()
-
-
-def _link_str(x) -> str:
-    """Normalize links to a single string for CVDoc.contacts.links."""
-    if not x:
-        return ""
-    if isinstance(x, str):
-        return x.strip()
-    if isinstance(x, list):
-        for v in x:
-            if isinstance(v, str) and v.strip():
-                return v.strip()
-        return ""
-    if isinstance(x, dict):
-        for k in ("linkedin", "github", "portfolio", "url", "site"):
-            v = x.get(k)
-            if isinstance(v, str) and v.strip():
-                return v.strip()
-        return ""
-    return str(x).strip()
 
 
 def _extract_list_after_heading(md: str, heading_regex: str) -> list[str]:
