@@ -2,6 +2,7 @@
 # or with Env override -> APP_SEED=123 APP_GENERATION_PRIME=10009 python -m src.pipeline.generate_epoch --output data/synth/raw --generation 0
 import os
 import random
+import hashlib
 from typing import List, Tuple
 from pathlib import Path
 import json, uuid
@@ -97,7 +98,19 @@ def run_generation(output_dir: str, generation: int, top_k: float = 0.20):
         records.append((fit, rec))
 
     # select survivors (top_k) and persist ALL + survivors
-    records.sort(key=lambda x: x[0], reverse=True)
+    # select survivors (top_k) and persist ALL + survivors
+    # deterministic tie-break: shuffle with a seeded RNG, then add tiny id-based jitter
+    rng = random.Random(f"tiebrk|{generation}|{cfg.seed}")
+    rng.shuffle(records)
+
+    def _jitter(cv_id: str) -> float:
+        h = int(hashlib.sha256(cv_id.encode()).hexdigest(), 16)
+        return (h % 1000) / 1e7  # up to ~0.0000999
+
+    records.sort(
+        key=lambda x: (x[0] + _jitter(x[1].cv.id)),
+        reverse=True
+    )
     survivors = [r for _, r in records[: max(1, int(len(records) * top_k))]]
 
     # write artifacts
