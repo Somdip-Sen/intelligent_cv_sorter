@@ -1,14 +1,44 @@
+import random
 import re
-from typing import Tuple
 
 from .india_bank import IndiaBank
-from .placeholders import replace_placeholders_text, replace_placeholders_json, fix_common_placeholders, \
-    canonicalize_contacts
+from .placeholders import replace_placeholders_text, replace_placeholders_json, fix_common_placeholders
 
 _PH_RE = re.compile(
-    r"\[\[(CITY|STATE|COLLEGE|PIN|FULL_NAME|EMAIL|PHONE|LINKEDIN_PROFILE|LINKEDIN_URL|GITHUB_URL|GITHUB_HANDLE|PORTFOLIO_URL|WEBSITE)(\d+)?\]\]",
+    r"\[\[(CITY|STATE|COLLEGE|PIN|FULL_NAME|EMAIL|PHONE|LINKEDIN_PROFILE|LINKEDIN_URL|GITHUB_URL|GITHUB_HANDLE|PORTFOLIO_URL|WEBSITE)(\d+)?]]",
     re.I)
 RUPEE = "₹"
+_COLLEGE_TRIGGER = re.compile(r"\b(IIT|NIT|IIIT|BITS|University|Institute|College)\b", re.I)
+
+_DUMMY_EMAILS = {
+    "email", "e-mail", "email@example.com", "your.email@example.com", "name@email.com",
+    "mail@example.com", "candidate@email.com"
+}
+_DUMMY_LINKS = {
+    "linkedin.com/in/yourprofile", "https://linkedin.com/in/yourprofile",
+    "linkedin.com/in/candidatelinkedin", "https://linkedin.com/in/candidatelinkedin",
+    "github.com/candidategithub", "https://github.com/candidategithub"
+}
+
+_email_com_fix = re.compile(r'(\.com){2,}$')  # collapse .com.com...
+
+
+def _normalize_email(s: str, name: str, bank) -> str:
+    s = (s or "").strip().lower()
+    if not s or s in _DUMMY_EMAILS or "example.com" in s:
+        return bank.sample_email(name)
+
+    # keep only first local, last domain; remove spaces; collapse .com.com...
+    parts = [p for p in s.replace(" ", "").split("@") if p]
+    if len(parts) < 2:
+        return bank.sample_email(name)
+    local, domain = parts[0], parts[-1]
+    # strip weird chars from local, basic domain cleanup
+    local = re.sub(r"[^a-z0-9._+-]", "", local)
+    domain = _email_com_fix.sub(".com", domain)
+    if not local or "." not in domain:
+        return bank.sample_email(name)
+    return f"{local}@{domain}"
 
 
 def _has_placeholders(s: str) -> bool:
@@ -85,37 +115,136 @@ def _strip_college_from_degree(s: str) -> str:
     return s
 
 
+# --- common bare-placeholder scrubbers (LLM emits these often) ---
+_BARE_CONTACT_PATTERNS = [
+    # name
+    (re.compile(r"\b(Candidate\s+Name|Your\s+Name|Full\s+Name)\b", flags=re.I), "{name}"),
+    # email
+    (re.compile(r"\bemail@example\.com\b", flags=re.I), "{email}"),
+    # phone masks
+    (re.compile(r"\+91[-\s]?X{3,}[-\s]?X{3,}[-\s]?X{3,}", flags=re.I), "{phone}"),
+    (re.compile(r"\+91-?XXXXXXXXXX\b", flags=re.I), "{phone}"),
+    # LinkedIn/GitHub generic slugs
+    (re.compile(r"(https?://)?(www\.)?linkedin\.com/in/(yourprofile|candidatelinkedin|fullname)\b", flags=re.I),
+     "{linkedin}"),
+    (re.compile(r"(https?://)?github\.com/(yourusername|candidategithub)\b", flags=re.I), "{github}"),
+    # also bare hostnames
+    (re.compile(r"\blinkedin\.com/in/(yourprofile|candidatelinkedin|fullname)\b", flags=re.I), "{linkedin}"),
+]
+
+
+def _apply_bare_contact_subs(text: str, contacts: dict) -> str:
+    if not text:
+        return text
+    rep = {
+        "{name}": contacts.get("name", ""),
+        "{email}": contacts.get("email", ""),
+        "{phone}": contacts.get("phone", ""),
+        "{linkedin}": contacts.get("links", ""),
+        "{github}": contacts.get("links", ""),  # if you later add github separately, swap here
+    }
+    out = text
+    for pat, token in _BARE_CONTACT_PATTERNS:
+        out = pat.sub(rep[token], out)
+    return out
+
+
 def enforce_india_cv(cv: dict, bank: IndiaBank, senior_hint: str | None = None) -> dict:
     # 1) Resolve placeholders across the entire CV dict
-    cv, mapping = replace_placeholders_json(cv, bank)
+    # 1) Contacts: fill/normalize first
+    contacts = cv.get("contacts") or {}
+    name = contacts.get("name")
+    email = contacts.get("email")
+    phone = contacts.get("phone")
+    links = contacts.get("links")
 
-    # 2) Contacts canonicalization (string links, real email/phone/name)
-    cv["contacts"] = canonicalize_contacts(cv.get("contacts") or {}, bank, mapping)
+    if _is_placeholder_contact(name):  name = None
+    if _is_placeholder_contact(email): email = None
+    if _is_placeholder_contact(phone): phone = None
 
-    # 3) Fix raw_markdown/raw_text leftovers using the same mapping
-    for k in ("raw_markdown", "raw_text"):
-        txt = cv.get(k) or ""
-        if txt:
-            txt, mapping = replace_placeholders_text(txt, bank, mapping)
-            txt = fix_common_placeholders(txt, mapping)
-            cv[k] = txt
+    name = name or bank.sample_name()
+    email = _normalize_email(email, name, bank)
+    phone = phone or bank.sample_phone()
+    links = links or bank.sample_linkedin(name)  # default to LinkedIn-like URL
 
-    # 4) Sections fallback if empty or “name-only” bullet
-    secs = cv.get("sections") or []
+    if isinstance(links, list):  # model may return list; but links must be a single string (your schema), and not a dummy
+        links = next((v for v in links if isinstance(v, str) and v.strip()), "") or ""
+    elif not isinstance(links, str):
+        links = str(links or "").strip()
+    if links in _DUMMY_LINKS:
+        links = ""
 
-    def _bad_summary(bullets):
-        if not bullets: return True
-        only = [b.strip() for b in bullets if b and b.strip()]
-        return all(re.fullmatch(r"[A-Za-z .'-]{2,40}", b or "") for b in only) and len(only) <= 2
+    cv["contacts"] = {"name": name, "email": email, "phone": phone, "links": links}
 
-    if not secs or (len(secs) == 1 and secs[0].get("header", "").lower() == "summary" and _bad_summary(
-            secs[0].get("bullets", []))):
-        claim = cv.get("role_claim") or "Software Professional"
-        yrs = cv.get("years_experience")
-        pin = f" with {yrs}+ years" if yrs else ""
-        bullet = f"{claim}{pin} experienced in delivering impact across modern stacks."
-        cv["sections"] = [{"header": "Summary", "bullets": [bullet], "evidence": []}]
+    # 2) One shared mapping for all placeholders
+    phmap = {
+        "FULL_NAME1": name, "FULL_NAME": name,
+        "EMAIL1": email, "EMAIL": email,
+        "PHONE1": phone, "PHONE": phone,
+        "LINKEDIN_PROFILE1": links, "LINKEDIN_PROFILE": links,
+    }
 
+    # 3) Replace placeholders in JSON first (keeps consistency if JSON contains [[...]])
+    cv, phmap = replace_placeholders_json(cv, bank, phmap)
+
+    # 4) Replace placeholders in MD and Text using the SAME mapping
+    md, phmap = replace_placeholders_text(cv.get("raw_markdown") or "", bank, phmap)
+    tx, _ = replace_placeholders_text(cv.get("raw_text") or md, bank, phmap)
+
+    # 5) Scrub “bare” placeholders (Your Name, email@example.com, +91-XXXXX-XXXXX, etc.)
+    md = _apply_bare_contact_subs(md, cv["contacts"])
+    tx = _apply_bare_contact_subs(tx, cv["contacts"])
+
+    # 6) Sanitize to Indian context (but keep INR glyph readable)
+    md = bank.strip_non_indian_tokens(md)
+    tx = bank.strip_non_indian_tokens(tx)
+
+    def _patch_contact_dummies(txt: str) -> str:
+        if not txt: return txt
+        txt = txt.replace("Candidate Name", name).replace("[Your Name]", name)
+        txt = re.sub(r"\bemail@example\.com\b|\byour\.email@example\.com\b", email, txt)
+        txt = re.sub(r"\+91[- ]?X{4,}[- ]?X{4,}", phone, txt)  # +91-XXXXX-XXXXX
+        for d in list(_DUMMY_LINKS):
+            txt = txt.replace(d, links or f"https://linkedin.com/in/{name.lower().replace(' ', '')}")
+        return txt
+
+    def _fix_city_state_pairs(txt: str) -> str:
+        if not txt: return txt
+        # naive correction for "City, SomeState"
+        for city, state in bank.city_to_state.items():
+            # wrong state after this city → fix
+            txt = re.sub(rf"\b{re.escape(city)}\s*,\s*(?!{re.escape(state)}\b)[A-Za-z .]+\b",
+                         f"{city}, {state}", txt)
+        return txt
+
+    def _collapse_college_runs(txt: str) -> str:
+        if not txt: return txt
+
+        # find long “A - B - C - …” chains and keep just one item
+        def _pick_one(run: str) -> str:
+            parts = [p.strip() for p in run.split(" - ") if p.strip()]
+            if len(parts) >= 2:
+                return random.choice(parts)  # or bank.sample_college()
+            return run
+
+        # replace any long run before/after “Education” or degree line
+        txt = re.sub(r"([A-Za-z0-9().,&'/-]+\s(?:University|Institute|College|IIT|NIT|IIIT|BITS)[^#\n]{20,})",
+                     lambda m: _pick_one(m.group(1)), txt)
+        return txt
+
+    cv["raw_markdown"] = _collapse_college_runs(_fix_city_state_pairs(_patch_contact_dummies(md)))
+    cv["raw_text"] = _collapse_college_runs(_fix_city_state_pairs(_patch_contact_dummies(tx)))
+
+    # 7) Seniority floor
+    if senior_hint:
+        years = cv.get("years_experience")
+        if not years or float(years) < 5:
+            cv["years_experience"] = 5
+
+    # Log unresolved placeholders, if any
+    if _has_placeholders(cv.get("raw_markdown", "")) or _has_placeholders(cv.get("raw_text", "")):
+        with open("logs/raw/_placeholders_unresolved.log", "a", encoding="utf-8") as f:
+            f.write(f"CV {cv.get('id', 'unknown')} still has placeholders\n")
     return cv
 
 
@@ -134,17 +263,40 @@ def enforce_india_jd(jd: dict, bank: IndiaBank, senior_hint: str | None = None) 
         jd_json[key] = [x for x in clean if x]
 
     # 3) Salary hint + compensation line (never null)
-    lo, hi = _salary_lpa_range(bank, senior_hint)
-    jd_json["salary_hint"] = {"currency": "INR", "min_lpa": lo, "max_lpa": hi}
+    lo, hi = bank.sample_salary_lpa((senior_hint or "mid").lower())
+    # Make salary_hint a string to satisfy JobJD schema
+    jd_json["salary_hint"] = f"INR {lo}–{hi} LPA"
 
-    md = (jd_json.get("raw_text") or "").strip()
+    def _collapse_college_runs(txt: str) -> str:
+        if not txt: return txt
+
+        # find long “A - B - C - …” chains and keep just one item
+        def _pick_one(run: str) -> str:
+            parts = [p.strip() for p in run.split(" - ") if p.strip()]
+            if len(parts) >= 2:
+                return random.choice(parts)  # or bank.sample_college()
+            return run
+
+        # replace any long run before/after “Education” or degree line
+        txt = re.sub(r"([A-Za-z0-9().,&'/-]+\s(?:University|Institute|College|IIT|NIT|IIIT|BITS)[^#\n]{20,})",
+                     lambda m: _pick_one(m.group(1)), txt)
+        return txt
+
+    md = bank.strip_non_indian_tokens(jd.get("raw_text") or "")
     if md:
         # Fix compensation footer placeholder
-        md = re.sub(r"_Compensation.*$", "", md, flags=re.IGNORECASE | re.MULTILINE).strip()
-        md += f"\n\n_Compensation shown/paid in INR ({RUPEE}{lo}–{hi} LPA)._"
+        if "₹" not in md and jd.get("baseSalary") is None:
+            md = re.sub(r"_Compensation.*$", "", md, flags=re.IGNORECASE | re.MULTILINE).strip()
+            md += f"\n\n_Compensation shown/paid in INR ({RUPEE}{lo}–{hi} LPA)._"
         # Sweep any leftover sentinels
         md = fix_common_placeholders(md, mapping)
-        jd_json["raw_text"] = md
+
+        jd_json["raw_text"] = _collapse_college_runs(md)
+
+    # and ensure must_haves never contain “from <college>”
+    if isinstance(jd.get("must_haves"), list):
+        jd["must_haves"] = [re.sub(r"\s+from\b.*$", "", s, flags=re.I).strip() if isinstance(s, str) else s
+                            for s in jd["must_haves"]]
 
     # 4) Fill null location/company_stage as last resort
     if not jd_json.get("jobLocationType"):

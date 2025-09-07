@@ -26,6 +26,8 @@ class IndiaBank:
         self.p_inv = max(0.0, min(1.0, float(p_invent)))
         self._lock = threading.Lock()
         self._used = {"names": set(), "phones": set(), "emails": set()}
+        raw_map = self.data.get("city_to_state", {}) or {}
+        self.city_to_state = {str(k): (v[0] if isinstance(v, (list, tuple)) else str(v)) for k, v in raw_map.items()}  # for output
 
         # Normalize possibly hyphen-joined rows in YAML
         for k in ("first_names", "middel_names", "last_names", "cities_core",
