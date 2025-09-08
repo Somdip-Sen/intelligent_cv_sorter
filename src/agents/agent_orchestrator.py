@@ -1,6 +1,6 @@
 # smoke test -> export N_PERSONAS=10 N_JOBS=2 GENAI_RPM_SLEEP=1.1 (for the whole terminal) or
 # N_PERSONAS=5 N_JOBS=1 GENAI_RPM_SLEEP=1.1 python -m src.pipeline.generate_epoch --output data/synth/raw --generation 0/1/2/3/...
-
+import logging
 # with pro
 # export GEMINI_MODEL_JOB="models/gemini-2.5-flash"
 # export GEMINI_MODEL_CANDIDATE="models/gemini-2.5-flash"
@@ -54,8 +54,8 @@ BANK = IndiaBank("data/india_bank.yaml", p_invent=float(os.getenv("INDIA_P_INVEN
 def mk_model(env_var: str, default_name: str):
     name = os.getenv(env_var, default_name)
     try:
-        # Newer SDKs accept the 'model' kwarg
-        return genai.GenerativeModel(model=name)
+        # Newer SDKs accept the 'model_name' kwarg
+        return genai.GenerativeModel(model_name=name)
     except TypeError:
         # Older examples allow positional
         return genai.GenerativeModel(name)
@@ -130,14 +130,95 @@ def _skills_to_strings(sk) -> list[str]:
                 if isinstance(k, str):
                     out.append(k)
     # dedupe, preserve order
-    seen = set();
+    seen = set()
     flat = []
     for s in out:
         s = s.strip()
         if s and s.lower() not in seen:
-            seen.add(s.lower());
+            seen.add(s.lower())
             flat.append(s)
     return flat
+
+
+def _strip_code_fences(s: str) -> str:
+    if not s: return ""
+    return re.sub(r"```(?:json|JSON)?|```", "", s).strip()
+
+
+def _json_sanitize(s: str) -> str:
+    if not s: return ""
+    s = _strip_code_fences(s)
+    s = s.replace("\r", "")
+    # remove // and /* */ comments
+    s = re.sub(r"//.*?$", "", s, flags=re.MULTILINE)
+    s = re.sub(r"/\*[\s\S]*?\*/", "", s)
+    # Python → JSON literals
+    s = re.sub(r"\bTrue\b", "true", s)
+    s = re.sub(r"\bFalse\b", "false", s)
+    s = re.sub(r"\bNone\b", "null", s)
+    # fix trailing commas before } or ]
+    s = re.sub(r",\s*([}\]])", r"\1", s)
+    return s
+
+
+def _extract_top_json_array(s: str) -> str | None:
+    """Return the first top-level JSON array substring using bracket balancing."""
+    start = s.find("[")
+    if start == -1: return None
+    depth = 0
+    in_str = False
+    esc = False
+    for i, ch in enumerate(s[start:], start=start):
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == "\"":
+                in_str = False
+            continue
+        if ch == "\"":
+            in_str = True
+        elif ch == "[":
+            depth += 1
+        elif ch == "]":
+            depth -= 1
+            if depth == 0:
+                return s[start:i + 1]
+    return None
+
+
+def _parse_committee_json(text: str):
+    """Best-effort parse for committee outputs."""
+    s = _json_sanitize(text)
+
+    # 1) try whole payload
+    try:
+        j = json.loads(s)
+        if isinstance(j, list):
+            return j
+    except json.JSONDecodeError:
+        pass
+
+    # 2) try top-level array slice
+    arr_str = _extract_top_json_array(s)
+    if arr_str:
+        try:
+            return json.loads(_json_sanitize(arr_str))
+        except json.JSONDecodeError:
+            pass
+
+    # 3) fallback: collect dicts and keep those with expected keys
+    objs = []
+    for m in re.finditer(r"\{[^{}]*}", s, flags=re.DOTALL):
+        chunk = _json_sanitize(m.group(0))
+        try:
+            o = json.loads(chunk)
+            if isinstance(o, dict) and ("subscores" in o or "overall" in o):
+                objs.append(o)
+        except Exception:
+            continue
+    return objs
 
 
 def parse_multi_part_response(response_text: str) -> Dict[str, Any]:
@@ -161,7 +242,7 @@ def parse_multi_part_response(response_text: str) -> Dict[str, Any]:
     try:
         out["json"] = json.loads(strip_fences(s))
         return out
-    except Exception:
+    except json.JSONDecodeError:
         pass
 
     # 1) New canonical: JSON --- Markdown [--- YAML]
@@ -171,13 +252,13 @@ def parse_multi_part_response(response_text: str) -> Dict[str, Any]:
         # JSON object or array
         try:
             out["json"] = json.loads(first)
-        except Exception:
+        except json.JSONDecodeError:
             # extract first {...} or [...] if extra text crept in
-            m = re.search(r'[\{\[][\s\S]*[\}\]]', first)
+            m = re.search(r'[{\[][\s\S]*[}\]]', first)
             if m:
                 try:
                     out["json"] = json.loads(m.group(0))
-                except Exception:
+                except json.JSONDecodeError:
                     pass
 
         out["markdown"] = parts[1].strip()
@@ -186,19 +267,25 @@ def parse_multi_part_response(response_text: str) -> Dict[str, Any]:
             diag_raw = strip_fences(parts[2])
             try:
                 out["diag"] = yaml.safe_load(diag_raw)
-            except Exception:
+            except yaml.YAMLError as e:
+                # Now you know for sure the failure was due to invalid YAML
+                logging.warning(f"YAML parsing failed, keeping raw string. Error: {e}")
                 out["diag"] = diag_raw  # keep raw if YAML parse fails
         return out
 
     # 2) Fallback: find first JSON object/array anywhere; markdown is the prefix
     no_fence = strip_fences(s)
-    m = re.search(r'[\{\[][\s\S]*[\}\]]', no_fence)
+    m = re.search(r'[{\[][\s\S]*[}\]]', no_fence)
     if m:
         try:
             out["json"] = json.loads(m.group(0))
             out["markdown"] = s[: s.find(m.group(0))].strip()
             return out
-        except Exception:
+        except json.JSONDecodeError as e:
+            # Best practice is to log that this attempt failed
+            logging.warning(f"Regex found a JSON-like object that failed to parse: {e}")
+
+            # The original intent was to do nothing and let the code continue to the next fallback
             pass
 
     # 3) Fallback: try parsing whole payload YAML-as-JSON
@@ -207,8 +294,9 @@ def parse_multi_part_response(response_text: str) -> Dict[str, Any]:
         if isinstance(y, (dict, list)):
             out["json"] = y
             return out
-    except Exception:
-        pass
+    except yaml.YAMLError as e:
+        # Now you know for sure the failure was due to invalid YAML
+        logging.warning(f"YAML parsing failed, keeping raw string. Error: {e}")
 
     # 4) Give up → markdown-only
     print("[parse-fail]", s[:200].replace("\n", " "), "...")
@@ -235,7 +323,7 @@ def _model(agent: str) -> genai.GenerativeModel:
 
     m = None
     for ctor in (
-            lambda n: genai.GenerativeModel(model=n),  # newer SDKs
+            lambda n: genai.GenerativeModel(model_name=n),  # newer SDKs
             lambda n: genai.GenerativeModel(model_name=n),  # some mid versions
             lambda n: genai.GenerativeModel(n),  # older positional
     ):
@@ -250,7 +338,7 @@ def _model(agent: str) -> genai.GenerativeModel:
     # optional: expose a label for caching without touching read-only props
     try:
         setattr(m, "_cache_model_label", name)
-    except Exception:
+    except AttributeError:
         pass
     return m
 
@@ -266,12 +354,12 @@ def safe_curly_format(template: str, vars: dict) -> str:
     keys = sorted(vars.keys(), key=len, reverse=True)
     sent = {k: f"@@__{k}__@@" for k in keys}
     for k, s in sent.items():
-        template = re.sub(r"\{" + re.escape(k) + r"\}", s, template)
+        template = re.sub(rf"\{{re.escape(k)}}", s, template)
     # 2) escape all remaining braces so JSON stays intact
     template = template.replace("{", "{{").replace("}", "}}")
     # 3) restore placeholders and format
     for k, s in sent.items():
-        template = template.replace(s, "{" + k + "}")
+        template.replace(s, f"{{{k}}}")
     return template.format(**vars)
 
 
@@ -377,7 +465,7 @@ def run_candidate_agent(candidate_inputs: Dict[str, Any]) -> Dict[str, Any]:
         headline = basics.get("summary") or ""
 
         # collect skills (strings + dict.keywords/name), dedupe
-        skills = []
+        skills: list[str] = []
         for s in (j.get("skills") or []):
             if isinstance(s, dict):
                 if s.get("name"):
@@ -385,18 +473,17 @@ def run_candidate_agent(candidate_inputs: Dict[str, Any]) -> Dict[str, Any]:
                 skills.extend(s.get("keywords") or [])
             elif isinstance(s, str):
                 skills.append(s)
-        seen = set();
+        seen = set()
         skills_norm = []
         for s in skills:
             k = s.strip().lower()
             if k and k not in seen:
-                seen.add(k);
+                seen.add(k)
                 skills_norm.append(s.strip())
         skills_norm = skills_norm[:15]
 
         # build a compact, human-readable resume markdown
-        md = []
-        md.append(f"# {name}")
+        md = [f"# {name}"]
         contact = " · ".join([p for p in [email, phone] if p])
         if contact:
             md.append(contact)
@@ -501,7 +588,7 @@ def run_recruiter_agent_json(job_description: str, cv_text: str, judge_id: str =
         js = json.loads(txt)
     except Exception:
         # Fallback: find first JSON object
-        m = re.search(r'\[[\s\S]*\]|\{[\s\S]*\}', txt)  # first JSON object/array
+        m = re.search(r'\[[\s\S]*]|\{[\s\S]*}', txt)  # first JSON object/array
         js = json.loads(m.group(0)) if m else {"subscores": {}, "overall": 0.0}
 
     # ---- SHAPE GUARD: if model slipped an ARRAY for single, take first ----
@@ -605,8 +692,7 @@ def run_recruiter_committee_once(job_description: str, cv_text: str, profiles: l
     txt = data["text"].strip()
 
     # Parse committee array
-    m = re.search(r"\[.*\]", txt, re.DOTALL)
-    arr = json.loads(m.group(0)) if m else []
+    arr = _parse_committee_json(txt)
     out = []
 
     def clamp01(x):
@@ -723,7 +809,17 @@ def generate_jobs(generation: int, n_jobs: Optional[int] = None) -> List[Dict[st
         title_lc = (jd_json.get("title") or "").lower()
         senior_hint = "senior" if any(k in title_lc for k in ("senior", "staff", "lead", "principal")) else "mid"
         jd_json = enforce_india_jd(jd_json, BANK, senior_hint=senior_hint)
-
+        val = jd_json.get("salary_hint")
+        if isinstance(val, dict):
+            cur = val.get("currency", "INR")
+            lo = val.get("min_lpa") or val.get("min") or val.get("low")
+            hi = val.get("max_lpa") or val.get("max") or val.get("high")
+            if lo and hi:
+                jd_json["salary_hint"] = f"{cur} {lo}–{hi} LPA"
+            else:
+                # fallback if dict is incomplete
+                lo, hi = BANK.sample_salary_lpa((senior_hint or "mid").lower())
+                jd_json["salary_hint"] = f"INR {lo}–{hi} LPA"
         jobs.append(jd_json)
     return jobs
 
@@ -771,6 +867,7 @@ def tailor_cv(persona: Any, jd: Any) -> Dict[str, Any]:
             cv_json["years_experience"] = 5
     # print(f"CV - JSON \n\n {json.dumps(cv_json, indent=2)}")
 
+    basic_url = (cv_json.get("basics", {}) or {}).get("url")
     contacts_src = cv_json.get("contacts") or {}
     basic_url = (cv_json.get("basics", {}) or {}).get("url")
     contacts = {
@@ -900,8 +997,8 @@ def score_cv_committee(cv: Any, jd: Any, n_judges: int = 3) -> List[Dict[str, An
 def _markdown_to_text(md: str) -> str:
     # very light markdown → text (keep it simple for now)
     text = re.sub(r"`{1,3}.*?`{1,3}", "", md, flags=re.DOTALL)  # remove code blocks/inline
-    text = re.sub(r"!\[.*?\]\(.*?\)", "", text)  # images
-    text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text)  # links → anchor text
+    text = re.sub(r"!\[.*?]\(.*?\)", "", text)  # images
+    text = re.sub(r"\[([^]]+)]\([^)]+\)", r"\1", text)  # links → anchor text
     text = re.sub(r"^#{1,6}\s*", "", text, flags=re.MULTILINE)  # headings
     text = re.sub(r"\*\*|\*", "", text)  # bold/italics
     return text.strip()

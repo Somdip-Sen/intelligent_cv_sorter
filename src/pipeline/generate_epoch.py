@@ -1,25 +1,20 @@
 # Run CLI -> python -m src.pipeline.generate_epoch --output data/synth/raw --generation 0
 # or with Env override -> APP_SEED=123 APP_GENERATION_PRIME=10009 python -m src.pipeline.generate_epoch --output data/synth/raw --generation 0
+import hashlib
 import os
 import random
-import hashlib
-from typing import List, Tuple
-from pathlib import Path
-import json, uuid
-from pydantic import ValidationError
-from statistics import mean
-
-from src.schemas.entities import Persona, JobJD, CVDoc, RecruiterScore, SampleRecord
-from src.scoring.fitness import aggregate_committee, fitness
-from src.utils.similarity import lsh_index, dup_similarity
-from src.utils.run_ctx import mlflow_run, set_seed
-from src.utils.storage import save_jsonl  # implement simple writer
-from src.config.settings import load_cfg
-
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+from statistics import mean
 
 # NOTE: adapt these to your agent_orchestrator functions
 from src.agents.agent_orchestrator import generate_personas, generate_jobs, tailor_cv, score_cv_committee
+from src.config.settings import load_cfg
+from src.schemas.entities import Persona, JobJD, CVDoc, RecruiterScore, SampleRecord
+from src.scoring.fitness import aggregate_committee, fitness
+from src.utils.run_ctx import mlflow_run, set_seed
+from src.utils.similarity import lsh_index, dup_similarity
+from src.utils.storage import save_jsonl  # implement simple writer
 
 cfg = load_cfg()  # or load_cfg(cli_seed=args.seed)
 set_seed(cfg.seed)  # your existing helper
@@ -35,7 +30,7 @@ def run_generation(output_dir: str, generation: int, top_k: float = 0.20):
     rng.shuffle(personas)
     jobs = [JobJD.model_validate(j) for j in generate_jobs(generation)]
 
-    ## serial code ----
+    # ------ serial code ----
     # samples, sigs = [], []
     # # draft CVs
     # for jd in jobs:
@@ -48,9 +43,9 @@ def run_generation(output_dir: str, generation: int, top_k: float = 0.20):
     #
     #         samples.append((cv, jd, pe, rs, subs))
     #         sigs.append((cv.id, cv.raw_text))
-    ## ----
+    # ----
 
-    ## parallel version code ----
+    # ------ parallel version code ----
     def _build_sample(pe, jd):
         cv_raw = tailor_cv(pe, jd)
         cv = CVDoc.model_validate(cv_raw)
