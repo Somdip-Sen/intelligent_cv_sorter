@@ -208,13 +208,15 @@ def enforce_india_cv(cv: dict, bank: IndiaBank, senior_hint: str | None = None) 
             txt = txt.replace(d, links or f"https://linkedin.com/in/{name.lower().replace(' ', '')}")
         return txt
 
-    def _fix_city_state_pairs(txt: str) -> str:
-        if not txt: return txt
-        # naive correction for "City, SomeState"
-        for city, state in bank.city_to_state.items():
-            # wrong state after this city → fix
-            txt = re.sub(rf"\b{re.escape(city)}\s*,\s*(?!{re.escape(state)}\b)[A-Za-z .]+\b",
-                         f"{city}, {state}", txt)
+    def _fix_city_state_pairs(text: str) -> str:
+        if not text:
+            return text
+        txt = text
+        # Use YAML mapping: state -> [cities]
+        for state, cities in (getattr(bank, "state_to_cities", {}) or {}).items():
+            for city in (cities or []):
+                pattern = rf"(?<!\w){re.escape(str(city))}\s*,\s*[A-Za-z .]+"
+                txt = re.sub(pattern, f"{city}, {state}", txt)
         return txt
 
     def _collapse_college_runs(txt: str) -> str:
@@ -241,6 +243,20 @@ def enforce_india_cv(cv: dict, bank: IndiaBank, senior_hint: str | None = None) 
         if not years or float(years) < 5:
             cv["years_experience"] = 5
 
+    for sec in cv.get("sections", []):
+        if (sec.get("header") or "").strip().lower() == "summary" and not sec.get("bullets"):
+            role = cv.get("role_claim") or "Software Engineer"
+            senior = (cv.get("seniority_claim") or "").title()
+            sec["bullets"] = [f"{senior} {role} with impact across backend, APIs, cloud, and distributed systems."]
+    secs = cv.get("sections")
+    if isinstance(secs, list):
+        for s in secs:
+            # keep only non-empty bullets
+            if isinstance(s.get("bullets"), list):
+                s["bullets"] = [b.strip() for b in s["bullets"] if isinstance(b, str) and b.strip()]
+            # drop empty evidence key
+            if "evidence" in s and (not isinstance(s["evidence"], list) or not s["evidence"]):
+                s.pop("evidence", None)
     # Log unresolved placeholders, if any
     if _has_placeholders(cv.get("raw_markdown", "")) or _has_placeholders(cv.get("raw_text", "")):
         with open("logs/raw/_placeholders_unresolved.log", "a", encoding="utf-8") as f:

@@ -117,12 +117,14 @@ def replace_placeholders_text(
             mapping[key] = bank.sample_phone()
         elif tag in ("LINKEDIN_PROFILE", "LINKEDIN_URL"):
             nm = mapping.get(_k("FULL_NAME", idx)) or bank.sample_name()
+            v = bank.sample_linkedin(nm)
             slug = re.sub(r"[^a-z0-9]+", "", nm.lower())
-            mapping[key] = f"https://linkedin.com/in/{slug}{random.randint(10, 99)}"
+            mapping[key] = v or f"https://linkedin.com/in/{slug}{random.randint(10, 99)}"
         elif tag == "GITHUB_URL":
             nm = mapping.get(_k("FULL_NAME", idx)) or bank.sample_name()
+            v = bank.sample_github(nm)
             slug = re.sub(r"[^a-z0-9]+", "", nm.lower())
-            mapping[key] = f"https://github.com/{slug}{random.randint(10, 99)}"
+            mapping[key] = v or f"https://github.com/{slug}{random.randint(10, 99)}"
         else:
             mapping[key] = ""
         return mapping[key]

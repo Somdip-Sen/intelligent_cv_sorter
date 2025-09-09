@@ -245,6 +245,41 @@ def parse_multi_part_response(response_text: str) -> Dict[str, Any]:
     except json.JSONDecodeError:
         pass
 
+    def _first_balanced_json(payload: str) -> tuple[str | None, int | None]:
+        s = payload
+        start_idx = None
+        depth = 0
+        in_str = False
+        esc = False
+        opener = None
+        for i, ch in enumerate(s):
+            if start_idx is None:
+                if ch in "{[":
+                    start_idx = i
+                    opener = ch
+                    depth = 1
+                    in_str = False
+                    esc = False
+                continue
+            # inside candidate JSON
+            if in_str:
+                if not esc and ch == '"':
+                    in_str = False
+                esc = (ch == '\\') and not esc
+                continue
+            else:
+                if ch == '"':
+                    in_str = True
+                    esc = False
+                    continue
+                if ch in "{[":
+                    depth += 1
+                elif ch in "}]":
+                    depth -= 1
+                    if depth == 0:
+                        return s[start_idx:i + 1], start_idx
+        return None, None
+
     # 1) New canonical: JSON --- Markdown [--- YAML]
     parts = re.split(r'(?m)^\s*---\s*$', s)
     if len(parts) >= 2:
@@ -275,16 +310,15 @@ def parse_multi_part_response(response_text: str) -> Dict[str, Any]:
 
     # 2) Fallback: find first JSON object/array anywhere; markdown is the prefix
     no_fence = strip_fences(s)
-    m = re.search(r'[{\[][\s\S]*[}\]]', no_fence)
-    if m:
+    frag, idx0 = _first_balanced_json(no_fence)
+    if frag:
         try:
-            out["json"] = json.loads(m.group(0))
-            out["markdown"] = s[: s.find(m.group(0))].strip()
+            out["json"] = json.loads(frag)
+            out["markdown"] = no_fence[idx0+len(frag):].lstrip()
             return out
         except json.JSONDecodeError as e:
             # Best practice is to log that this attempt failed
             logging.warning(f"Regex found a JSON-like object that failed to parse: {e}")
-
             # The original intent was to do nothing and let the code continue to the next fallback
             pass
 
@@ -383,9 +417,14 @@ def run_job_agent(job_details: Dict[str, Any]) -> Dict[str, Any]:
     }
     defaults.update(job_details)
     prompt = safe_curly_format(prompt_template, defaults)
-    gen_cfg = {"temperature": 0.50, "top_p": 0.9, "top_k": 48,
-               # "response_mime_type": "application/json",  # # JSON-only mode (ignored by older SDKs)
-               "max_output_tokens": int(os.getenv("MAX_OUTPUT_TOKENS", '8000'))}
+
+    gen_cfg = {
+        "temperature": 0.45 + 0.20 * random.random(),
+        "top_p": 0.9, "top_k": 48,
+        "max_output_tokens": int(os.getenv("MAX_OUTPUT_TOKENS", '11000')),
+        "stop_sequences": ["\n---\n"],  # <- back to the separator the parser expects
+        # "response_mime_type": "application/json",  # # JSON-only mode (ignored by older SDKs)
+    }
     _print_prompt_tokens(model, prompt, "job_agent")
     data = call_with_cache(model, prompt, generation_config=gen_cfg)  # cache key = (MODEL, prompt)
     if not data.get("cached"):
@@ -422,19 +461,28 @@ def run_candidate_agent(candidate_inputs: Dict[str, Any]) -> Dict[str, Any]:
         "max_pages": 1, "locale": "en-IN", "salary_expectation": "null",
         "legal": "", "redact_pii": "false", "region_hint": "India"
     }
-    defaults.update(candidate_inputs)
-    prompt = safe_curly_format(prompt_template, defaults)
-    # seed variability (deterministic across runs)
-    seed_src = f"cand|{defaults.get('generation')}|{defaults.get('mutation_seed')}|{cfg.seed}"
-    seed = int(hashlib.sha256(seed_src.encode()).hexdigest(), 16) % 10 ** 9
-    rng = random.Random(seed)
     gen_cfg = {
-        "temperature": 0.45 + 0.20 * rng.random(),  # 0.45–0.65
+        "temperature": 0.45 + 0.20 * random.random(),  # 0.45–0.65
         "top_p": 0.9, "top_k": 48,
         # "response_mime_type": "application/json",  # # JSON-only mode (ignored by older SDKs)
         "max_output_tokens": 11000,
         "stop_sequences": ["\n## END"]
     }
+    contract = (
+        "\n\n[OUTPUT CONTRACT]\n"
+        "Emit exactly:\n"
+        "  1) A single JSON object (no trailing commas).\n"
+        "  2) A line with only ---\n"
+        "  3) Markdown resume.\n"
+        "ASCII only. No extra prose before/after. Do not include code fences."
+    )
+    defaults.update(candidate_inputs)
+    prompt = safe_curly_format(prompt_template, defaults) + contract
+    # seed variability (deterministic across runs)
+    seed_src = f"cand|{defaults.get('generation')}|{defaults.get('mutation_seed')}|{cfg.seed}"
+    seed = int(hashlib.sha256(seed_src.encode()).hexdigest(), 16) % 10 ** 9
+    rng = random.Random(seed)
+
     _print_prompt_tokens(model, prompt, "candidate_agent")
     data = call_with_cache(model, prompt, generation_config=gen_cfg)
     if not data.get("cached"): _sleep()
@@ -543,6 +591,7 @@ def run_recruiter_agent_json(job_description: str, cv_text: str, judge_id: str =
         "Return JSON only (no prose), minified, with keys 'subscores' and 'overall'. "
         "All values in [0,1]. Unknown → 0.0."
     )
+
     persona_hint = (
         f"\n\n[JUDGE PROFILE]\n"
         f"- id: {judge_id}\n"

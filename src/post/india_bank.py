@@ -26,12 +26,31 @@ class IndiaBank:
         self.p_inv = max(0.0, min(1.0, float(p_invent)))
         self._lock = threading.Lock()
         self._used = {"names": set(), "phones": set(), "emails": set()}
-        raw_map = self.data.get("city_to_state", {}) or {}
-        self.city_to_state = {str(k): (v[0] if isinstance(v, (list, tuple)) else str(v)) for k, v in raw_map.items()}  # for output
+        # 1) Load state→cities (prefer "states"; fallback to "state_to_cities" if your YAML used that name)
+        self.state_to_cities = (
+                self.data.get("states")
+                or self.data.get("state_to_cities")
+                or {}
+        )
+
+        # load state -> [cities]
+        raw_map = self.data.get("city_to_state") or {}
+        if not isinstance(raw_map, dict):
+            raw_map = {}
+
+        # authoritative mapping from YAML
+        self.state_to_cities = {str(st): [str(c) for c in (cities or [])]
+                                for st, cities in raw_map.items()}
+
+        # build reverse map: city -> state (for lookups/replacements)
+        self.city_to_state = {c: st
+                              for st, cities in self.state_to_cities.items()
+                              for c in cities}
 
         # Normalize possibly hyphen-joined rows in YAML
         for k in ("first_names", "middel_names", "last_names", "cities_core",
-                  "cities_extra", "companies_curated", "email_domains", "colleges"):
+                  "cities_extra", "companies_curated", "email_domains",
+                  "colleges_tier1", "colleges_tier2", "colleges_tier3"):
             if k in self.data:
                 self.data[k] = _flatten_list_maybe_hyphen(self.data[k])
 
@@ -163,23 +182,29 @@ class IndiaBank:
 
     # ----- state -----
     def sample_state(self, city: str | None = None):
-        # prefer explicit mapping if provided in YAML; else lightweight defaults to random state
-        m = self.data.get("city_to_state") or {}
-        states = self.data.get("states") or [
-            "Karnataka", "Maharashtra", "Delhi", "Tamil Nadu", "Telangana", "Uttar Pradesh",
-            "Gujarat", "West Bengal", "Rajasthan", "Haryana", "Punjab", "Kerala"
-        ]
-        if city and city in m:
-            return m[city]
-        return self.rng.choice(states)
+        if city:
+            s = self.city_to_state.get(city)
+            if isinstance(s, (list, tuple)):  # just in case
+                s = s[0] if s else ""
+            if s:
+                return str(s)
+            # fallback: pick a common Indian state
+        return self.rng.choice(self.data.get("states_core", [
+            "Karnataka", "Maharashtra", "Tamil Nadu", "Delhi", "Telangana", "West Bengal", "Gujarat", "Haryana"
+        ]))
 
         # ----- pin -----
     def sample_pin(self, city: str | None = None, state: str | None = None):
-        by_city = self.data.get("pins_by_city") or {}
-        if city and city in by_city:
-            return str(self.rng.choice(by_city[city]))
-        # simple synthetic fallback
-        return str(self.rng.randint(100000, 799999))
+        pins_by_state = self.data.get("state_to_pins", {}) or {}
+        if not state and city:
+            state = self.city_to_state.get(city)
+            if isinstance(state, (list, tuple)):
+                state = state[0] if state else None
+        if state and state in pins_by_state and pins_by_state[state]:
+            return str(self.rng.choice(pins_by_state[state]))
+        # flat fallback
+        flat = [p for lst in pins_by_state.values() for p in (lst or [])]
+        return str(self.rng.choice(flat)) if flat else str(self.rng.randint(110000, 860000))
 
         # --------github ------------
     def github_handle(self, name: str) -> str:
