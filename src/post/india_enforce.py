@@ -195,6 +195,7 @@ def enforce_india_cv(cv: dict, bank: IndiaBank, senior_hint: str | None = None) 
     md = _apply_bare_contact_subs(md, cv["contacts"])
     tx = _apply_bare_contact_subs(tx, cv["contacts"])
 
+
     # 6) Sanitize to Indian context (but keep INR glyph readable)
     md = bank.strip_non_indian_tokens(md)
     tx = bank.strip_non_indian_tokens(tx)
@@ -226,7 +227,7 @@ def enforce_india_cv(cv: dict, bank: IndiaBank, senior_hint: str | None = None) 
         def _pick_one(run: str) -> str:
             parts = [p.strip() for p in run.split(" - ") if p.strip()]
             if len(parts) >= 2:
-                return random.choice(parts)  # or bank.sample_college()
+                return bank.sample_college()
             return run
 
         # replace any long run before/after “Education” or degree line
@@ -245,9 +246,19 @@ def enforce_india_cv(cv: dict, bank: IndiaBank, senior_hint: str | None = None) 
 
     for sec in cv.get("sections", []):
         if (sec.get("header") or "").strip().lower() == "summary" and not sec.get("bullets"):
-            role = cv.get("role_claim") or "Software Engineer"
-            senior = (cv.get("seniority_claim") or "").title()
-            sec["bullets"] = [f"{senior} {role} with impact across backend, APIs, cloud, and distributed systems."]
+            role = (cv.get("role_claim") or "Software Engineer").strip()
+            sen  = (cv.get("seniority_claim") or (senior_hint or "")).strip()
+
+            # avoid "Senior Senior ..." if role already includes the seniority word
+            if sen and sen.lower() in role.lower():
+                sen = ""
+
+            skills_src = cv.get("skills") or []
+            skills = [s for s in skills_src if isinstance(s, str) and s and len(s) < 40][:4]
+            areas = ", ".join(skills) if skills else "backend systems, APIs, cloud"
+
+            summary = f"{(sen.title() + ' ') if sen else ''}{role} with impact across {areas}."
+            sec["bullets"] = [summary]
     secs = cv.get("sections")
     if isinstance(secs, list):
         for s in secs:

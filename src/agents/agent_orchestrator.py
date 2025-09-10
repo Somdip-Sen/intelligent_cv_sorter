@@ -850,14 +850,40 @@ def generate_jobs(generation: int, n_jobs: Optional[int] = None) -> List[Dict[st
                 "address": {"@type": "PostalAddress", "addressLocality": city, "addressCountry": "IN"}
             }]
 
-        # Ensure MD mentions INR once
-        if "₹" not in (jd_json.get("raw_text") or ""):
-            jd_json["raw_text"] = (jd_json.get("raw_text") or "") + "\n\n_Compensation shown/paid in INR (₹, LPA)._"
-
         # Call the enforcer ONCE (handles placeholders in JSON, lists, and Markdown)
         title_lc = (jd_json.get("title") or "").lower()
         senior_hint = "senior" if any(k in title_lc for k in ("senior", "staff", "lead", "principal")) else "mid"
         jd_json = enforce_india_jd(jd_json, BANK, senior_hint=senior_hint)
+
+        # Ensure MD mentions INR once
+        if "₹" not in jd_json.get("raw_text", ""):
+            # derive a seniority key from JD fields (fallback = mid)
+            title_blob = " ".join([
+                str(jd_json.get("seniority_hint", "")),
+                str(jd_json.get("seniority", "")),
+                str(jd_json.get("title", "")),
+                str(jd_json.get("role", "")),
+            ]).lower()
+
+            if "staff" in title_blob:
+                seniority_key = "staff"
+            elif "lead" in title_blob or "principal" in title_blob:
+                seniority_key = "lead"
+            elif "senior" in title_blob or re.search(r"\bsr\b", title_blob):
+                seniority_key = "senior"
+            elif "junior" in title_blob or re.search(r"\bjr\b", title_blob):
+                seniority_key = "junior"
+            else:
+                seniority_key = "mid"
+
+            bands = BANK.data.get("salary_lpa_by_seniority", {}) or {}
+            lo, hi = (bands.get(seniority_key) or bands.get("mid") or [12, 24])
+            lo, hi = int(lo), int(hi)
+            range_str = f"{lo}–{hi}"
+
+            jd_json["salary_hint"] = f"{range_str} LPA"
+            jd_json["raw_text"] = (jd_json.get(
+                "raw_text") or "") + f"\n\n_Compensation shown/paid in INR (₹, {range_str} LPA)._"
         val = jd_json.get("salary_hint")
         if isinstance(val, dict):
             cur = val.get("currency", "INR")
@@ -869,6 +895,9 @@ def generate_jobs(generation: int, n_jobs: Optional[int] = None) -> List[Dict[st
                 # fallback if dict is incomplete
                 lo, hi = BANK.sample_salary_lpa((senior_hint or "mid").lower())
                 jd_json["salary_hint"] = f"INR {lo}–{hi} LPA"
+
+
+
         jobs.append(jd_json)
     return jobs
 
