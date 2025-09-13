@@ -75,4 +75,4 @@ class SampleRecord(BaseModel):
     jd: JobJD
     persona: Persona
     scores: List[RecruiterScore]
-    meta: Dict[str, str] = Field(default_factory=dict)
+    meta: Dict[str, float] = Field(default_factory=dict)

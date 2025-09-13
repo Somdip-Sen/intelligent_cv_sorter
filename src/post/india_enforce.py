@@ -167,7 +167,8 @@ def enforce_india_cv(cv: dict, bank: IndiaBank, senior_hint: str | None = None) 
     phone = phone or bank.sample_phone()
     links = links or bank.sample_linkedin(name)  # default to LinkedIn-like URL
 
-    if isinstance(links, list):  # model may return list; but links must be a single string (your schema), and not a dummy
+    if isinstance(links,
+                  list):  # model may return list; but links must be a single string (your schema), and not a dummy
         links = next((v for v in links if isinstance(v, str) and v.strip()), "") or ""
     elif not isinstance(links, str):
         links = str(links or "").strip()
@@ -195,7 +196,6 @@ def enforce_india_cv(cv: dict, bank: IndiaBank, senior_hint: str | None = None) 
     md = _apply_bare_contact_subs(md, cv["contacts"])
     tx = _apply_bare_contact_subs(tx, cv["contacts"])
 
-
     # 6) Sanitize to Indian context (but keep INR glyph readable)
     md = bank.strip_non_indian_tokens(md)
     tx = bank.strip_non_indian_tokens(tx)
@@ -213,15 +213,35 @@ def enforce_india_cv(cv: dict, bank: IndiaBank, senior_hint: str | None = None) 
         if not text:
             return text
         txt = text
-        # Use YAML mapping: state -> [cities]
-        for state, cities in (getattr(bank, "state_to_cities", {}) or {}).items():
-            for city in (cities or []):
-                pattern = rf"(?<!\w){re.escape(str(city))}\s*,\s*[A-Za-z .]+"
-                txt = re.sub(pattern, f"{city}, {state}", txt)
+
+        # Build dynamic maps from BANK (no hardcoding)
+        state_to_cities = (getattr(bank, "state_to_cities", {}) or {})
+        city_to_state = {}
+        for st, cities in state_to_cities.items():
+            for c in (cities or []):
+                city_to_state[str(c)] = st
+
+        # Optional aliases from YAML (e.g., {"Gurgaon":"Gurugram","Ropar":"Rupnagar"})
+        aliases = (getattr(bank, "city_aliases", {}) or {})
+
+        # 1) Normalize alias city mentions to their canonical city name
+        for alias, canon in aliases.items():
+            # turn "alias, X" into "canon, X" (state fixed in next step)
+            txt = re.sub(rf'(?<!\w){re.escape(alias)}\s*,', f'{canon},', txt, flags=re.I)
+
+        # 2) Correct "City, WrongState" → "City, CorrectState" for all known cities
+        for city, correct in city_to_state.items():
+            txt = re.sub(
+                rf'(?<!\w){re.escape(city)}\s*,\s*(?!{re.escape(correct)}\b)[A-Za-z .-]+',
+                f'{city}, {correct}',
+                txt,
+                flags=re.I
+            )
         return txt
 
     def _collapse_college_runs(txt: str) -> str:
-        if not txt: return txt
+        if not txt: 
+            return txt
 
         # find long “A - B - C - …” chains and keep just one item
         def _pick_one(run: str) -> str:
@@ -235,8 +255,56 @@ def enforce_india_cv(cv: dict, bank: IndiaBank, senior_hint: str | None = None) 
                      lambda m: _pick_one(m.group(1)), txt)
         return txt
 
-    cv["raw_markdown"] = _collapse_college_runs(_fix_city_state_pairs(_patch_contact_dummies(md)))
-    cv["raw_text"] = _collapse_college_runs(_fix_city_state_pairs(_patch_contact_dummies(tx)))
+    # --- Education fixes: year ranges & institution/city/state ---
+    def _fix_edu_years(text: str) -> str:
+        """Normalize '20212025' or '2021 2025' or '2021 to 2025' → '2021-2025' in the Education block only."""
+        if not text:
+            return text
+        m = re.search(
+            r'(Education:?)([\s\S]+?)(\n(?:Experience|Projects|Skills|Certifications|Work Experience|Professional Experience)\b|$)',
+            text, flags=re.I)
+        if not m:
+            return text
+        head, edu, tail = m.group(1), m.group(2), text[m.end(2):]
+
+        def _line_fix(s: str) -> str:
+            # "2016 2020" or "20162020" → "2016-2020"
+            s = re.sub(r'\b((?:19|20)\d{2})\s*((?:19|20)\d{2})\b', r'\1-\2', s)
+            # "2016 to 2020" / "2016 – 2020" / "2016-2020" → "2016-2020"
+            s = re.sub(r'\b((?:19|20)\d{2})\s*(?:to|–|-)\s*((?:19|20)\d{2})\b', r'\1-\2', s, flags=re.I)
+            return s
+
+        edu_fixed = "\n".join(_line_fix(ln) for ln in edu.splitlines())
+        return text[:m.start()] + head + edu_fixed + tail
+
+    def _strip_institute_location(text: str) -> str:
+        if not text:
+            return text
+        m = re.search(
+            r'(Education:?)([\s\S]+?)(\n(?:Experience|Projects|Skills|Certifications|Work Experience|Professional Experience)\b|$)',
+            text, flags=re.I)
+        if not m:
+            return text
+        head, edu, tail = m.group(1), m.group(2), text[m.end(2):]
+
+        lines = []
+        for ln in edu.splitlines():
+            # Only touch likely degree/institute lines that also mention years/CGPA or a bar
+            if re.search(r'\b(19|20)\d{2}\b|\| |CGPA|GPA', ln, flags=re.I):
+                # Pattern: "<… Institute …>, City, State"  → keep "<… Institute …>"
+                ln = re.sub(
+                    r'(?i)(?P<inst>\b(?:IIT|IIIT|NIT|BITS|University|Institute|College)[^,\n|]*)\s*,\s*[A-Za-z .-]+\s*,\s*[A-Za-z .-]+',
+                    r'\g<inst>', ln)
+                # If it was only "<inst>, City" (no explicit state), drop the city too
+                ln = re.sub(
+                    r'(?i)(?P<inst>\b(?:IIT|IIIT|NIT|BITS|University|Institute|College)[^,\n|]*)\s*,\s*[A-Za-z .-]+(?!,)',
+                    r'\g<inst>', ln)
+            lines.append(ln)
+        edu_fixed = "\n".join(lines)
+        return text[:m.start()] + head + edu_fixed + tail
+
+    cv["raw_markdown"] = _collapse_college_runs(_fix_city_state_pairs(_fix_edu_years(_strip_institute_location(_patch_contact_dummies(md)))))
+    cv["raw_text"] = _collapse_college_runs(_fix_city_state_pairs(_fix_edu_years(_strip_institute_location(_patch_contact_dummies(tx)))))
 
     # 7) Seniority floor
     if senior_hint:
@@ -247,7 +315,7 @@ def enforce_india_cv(cv: dict, bank: IndiaBank, senior_hint: str | None = None) 
     for sec in cv.get("sections", []):
         if (sec.get("header") or "").strip().lower() == "summary" and not sec.get("bullets"):
             role = (cv.get("role_claim") or "Software Engineer").strip()
-            sen  = (cv.get("seniority_claim") or (senior_hint or "")).strip()
+            sen = (cv.get("seniority_claim") or (senior_hint or "")).strip()
 
             # avoid "Senior Senior ..." if role already includes the seniority word
             if sen and sen.lower() in role.lower():

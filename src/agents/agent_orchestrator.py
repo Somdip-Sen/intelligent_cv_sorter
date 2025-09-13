@@ -1,6 +1,28 @@
 # smoke test -> export N_PERSONAS=10 N_JOBS=2 GENAI_RPM_SLEEP=1.1 (for the whole terminal) or
 # N_PERSONAS=5 N_JOBS=1 GENAI_RPM_SLEEP=1.1 python -m src.pipeline.generate_epoch --output data/synth/raw --generation 0/1/2/3/...
+import hashlib
+import json
 import logging
+import os
+import random
+import re
+import time
+import uuid
+from typing import List, Dict, Any, Optional
+
+import google.generativeai as genai
+import yaml
+from dotenv import load_dotenv
+from google.generativeai.types import GenerationConfig
+
+from src.config.settings import load_cfg
+from src.evolution.style_genes import gen_style_profile
+from src.post.india_bank import IndiaBank
+from src.post.india_enforce import enforce_india_cv, enforce_india_jd
+from src.post.placeholders import normalize_links_str
+from src.utils.cache import call_with_cache, debug_dump
+from src.utils.run_ctx import set_seed
+
 # with pro
 # export GEMINI_MODEL_JOB="models/gemini-2.5-flash"
 # export GEMINI_MODEL_CANDIDATE="models/gemini-2.5-flash"
@@ -11,28 +33,6 @@ import logging
 # # (optional) run-size & budget for the day
 # export N_PERSONAS=8 N_JOBS=2 LLM_BUDGET=80 GENAI_RPM_SLEEP=0.8
 # python -m src.pipeline.generate_epoch --output data/synth/raw --generation 3
-
-import os
-import random
-import re
-import json
-import time
-import uuid
-import hashlib
-from typing import List, Dict, Any, Optional
-from dotenv import load_dotenv
-
-from src.evolution.style_genes import gen_style_profile
-import google.generativeai as genai
-from google.generativeai.types import GenerationConfig
-import yaml
-from src.config.settings import load_cfg
-from src.utils.run_ctx import set_seed
-from src.utils.cache import call_with_cache, debug_dump
-
-from src.post.india_bank import IndiaBank
-from src.post.india_enforce import enforce_india_cv, enforce_india_jd
-from src.post.placeholders import normalize_links_str
 
 cfg = load_cfg()  # or load_cfg(cli_seed=args.seed)
 set_seed(cfg.seed)  # your existing helper
@@ -314,7 +314,7 @@ def parse_multi_part_response(response_text: str) -> Dict[str, Any]:
     if frag:
         try:
             out["json"] = json.loads(frag)
-            out["markdown"] = no_fence[idx0+len(frag):].lstrip()
+            out["markdown"] = no_fence[idx0 + len(frag):].lstrip()
             return out
         except json.JSONDecodeError as e:
             # Best practice is to log that this attempt failed
@@ -387,13 +387,14 @@ def safe_curly_format(template: str, vars: dict) -> str:
     # 1) temporarily replace our placeholders {key} with sentinels
     keys = sorted(vars.keys(), key=len, reverse=True)
     sent = {k: f"@@__{k}__@@" for k in keys}
-    for k, s in sent.items():
-        template = re.sub(rf"\{{re.escape(k)}}", s, template)
+    for k, sentinel in sent.items():
+        # replace literal {key} with a sentinel
+        template = re.sub(r"\{" + re.escape(k) + r"}", sentinel, template)
     # 2) escape all remaining braces so JSON stays intact
     template = template.replace("{", "{{").replace("}", "}}")
-    # 3) restore placeholders and format
-    for k, s in sent.items():
-        template.replace(s, f"{{{k}}}")
+    # 3) RESTORE sentinels back to {key}
+    for k, sentinel in sent.items():
+        template = template.replace(sentinel, "{" + k + "}")
     return template.format(**vars)
 
 
@@ -425,7 +426,12 @@ def run_job_agent(job_details: Dict[str, Any]) -> Dict[str, Any]:
         "stop_sequences": ["\n---\n"],  # <- back to the separator the parser expects
         # "response_mime_type": "application/json",  # # JSON-only mode (ignored by older SDKs)
     }
-    _print_prompt_tokens(model, prompt, "job_agent")
+
+    if os.getenv("PRINT_TOKENS_COUNT", "0") == "1":
+        _print_prompt_tokens(model, prompt, "job_agent")
+    else:
+        print(f"[Agent] JD_agent done...")
+
     data = call_with_cache(model, prompt, generation_config=gen_cfg)  # cache key = (MODEL, prompt)
     if not data.get("cached"):
         _sleep()
@@ -478,12 +484,11 @@ def run_candidate_agent(candidate_inputs: Dict[str, Any]) -> Dict[str, Any]:
     )
     defaults.update(candidate_inputs)
     prompt = safe_curly_format(prompt_template, defaults) + contract
-    # seed variability (deterministic across runs)
-    seed_src = f"cand|{defaults.get('generation')}|{defaults.get('mutation_seed')}|{cfg.seed}"
-    seed = int(hashlib.sha256(seed_src.encode()).hexdigest(), 16) % 10 ** 9
-    rng = random.Random(seed)
 
-    _print_prompt_tokens(model, prompt, "candidate_agent")
+    if os.getenv("PRINT_TOKENS_COUNT", "0") == "1":
+        _print_prompt_tokens(model, prompt, "candidate_agent")
+    else:
+        print(f"[Agent] candidate_agent done...")
     data = call_with_cache(model, prompt, generation_config=gen_cfg)
     if not data.get("cached"): _sleep()
     parts = parse_multi_part_response(data["text"])
@@ -626,7 +631,10 @@ def run_recruiter_agent_json(job_description: str, cv_text: str, judge_id: str =
         "candidate_count": int(gen_cfg.candidate_count),
         "max_output_tokens": int(gen_cfg.max_output_tokens)
     }
-    _print_prompt_tokens(model, prompt, "recruiter_agent")
+    if os.getenv("PRINT_TOKENS_COUNT", "0") == "1":
+        _print_prompt_tokens(model, prompt, "recruiter_agent")
+    else:
+        print(f"[Agent] recruiter_agent done...")
     print(f"[cfg recruiter_single] max_output_tokens={gen_cfg_dict['max_output_tokens']}")
     data = call_with_cache(model, prompt, generation_config=gen_cfg_dict)
     if not data.get("cached"): _sleep()
@@ -736,8 +744,13 @@ def run_recruiter_committee_once(job_description: str, cv_text: str, profiles: l
                     "max_output_tokens": 13000,
                     "response_mime_type": "application/json"  # # JSON-only mode
                     }
-    _print_prompt_tokens(model, prompt, "recruiter_commitee_agent")
+    if os.getenv("PRINT_TOKENS_COUNT", "0") == "1":
+        _print_prompt_tokens(model, prompt, "recruiter_committee_agent")
+    else:
+        print(f"[Agent] recruiter_committee_agent done...")
     data = call_with_cache(model, prompt, generation_config=gen_cfg_dict)
+    if not data.get("cached"):
+        _sleep()
     txt = data["text"].strip()
 
     # Parse committee array
@@ -896,8 +909,6 @@ def generate_jobs(generation: int, n_jobs: Optional[int] = None) -> List[Dict[st
                 lo, hi = BANK.sample_salary_lpa((senior_hint or "mid").lower())
                 jd_json["salary_hint"] = f"INR {lo}–{hi} LPA"
 
-
-
         jobs.append(jd_json)
     return jobs
 
@@ -945,15 +956,51 @@ def tailor_cv(persona: Any, jd: Any) -> Dict[str, Any]:
             cv_json["years_experience"] = 5
     # print(f"CV - JSON \n\n {json.dumps(cv_json, indent=2)}")
 
-    basic_url = (cv_json.get("basics", {}) or {}).get("url")
     contacts_src = cv_json.get("contacts") or {}
     basic_url = (cv_json.get("basics", {}) or {}).get("url")
+    _links = normalize_links_str(contacts_src.get("links") or basic_url)
+
     contacts = {
         "name": contacts_src.get("name") or (cv_json.get("basics", {}) or {}).get("name") or "",
         "email": contacts_src.get("email") or (cv_json.get("basics", {}) or {}).get("email") or "",
         "phone": contacts_src.get("phone") or (cv_json.get("basics", {}) or {}).get("phone") or "",
-        "links": normalize_links_str(contacts_src.get("links") or basic_url),
+        "links": _links if isinstance(_links, list) else ([_links] if _links else [])
     }
+    # --- Canonicalize the markdown header (non-destructive) ---
+    if cv_md:
+        import re
+        nm = contacts.get("name") or (cv_json.get("basics", {}) or {}).get("name") or ""
+        em = contacts.get("email") or (cv_json.get("basics", {}) or {}).get("email") or ""
+        ph = contacts.get("phone") or (cv_json.get("basics", {}) or {}).get("phone") or ""
+        lines = cv_md.splitlines()
+
+        # 1) ensure there is a title line
+        if not lines or not lines[0].lstrip().startswith("#"):
+            if nm:
+                lines = [f"# {nm}"] + lines
+            else:
+                # fallback: keep original if no name
+                pass
+        else:
+            if nm:
+                lines[0] = f"# {nm}"
+
+        # 2) build clean contact line from JSON contacts
+        contact_line = " · ".join([p for p in [em, ph] if p])
+
+        # 3) if the next line already exists, scrub any fused email tokens then replace/insert ours
+        email_rx = r'[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}'
+        if len(lines) >= 2:
+            # remove any dangling email fragments from the next two lines
+            for k in (1, 2):
+                if k < len(lines):
+                    lines[k] = re.sub(r'\s*[|·•,-]?\s*' + email_rx, '', lines[k])
+            if contact_line:
+                lines[1] = contact_line
+        elif contact_line:
+            lines.append(contact_line)
+
+        cv_md = "\n".join(lines)
 
     cv = {
         "id": f"cv-{uuid.uuid4().hex[:8]}",
@@ -994,84 +1041,142 @@ def score_cv_committee(cv: Any, jd: Any, n_judges: int = 3) -> List[Dict[str, An
     One-call committee by default. Falls back to single-judge calls only if parsing fails.
     Returns list of {cv_id, jd_id, judge_id, subscores, overall}.
     """
+    cv_full = _to_dict(cv)
 
-    # normalize JD to dict + markdown
+    # -------- token budgets (env-tunable) ----------
+    import os, re, json  # json already imported above in your file; safe to re-import
+    MAX_HL      = int(os.getenv("JUDGE_CV_HL_MAX",      "6"))
+    MAX_MUST    = int(os.getenv("JUDGE_JD_MUST_MAX",    "10"))
+    MAX_NICE    = int(os.getenv("JUDGE_JD_NICE_MAX",    "8"))
+    MAX_RESP    = int(os.getenv("JUDGE_JD_RESP_MAX",    "8"))
+    MAX_LOCS    = int(os.getenv("JUDGE_JD_LOCS_MAX",    "4"))
+    MAX_ITEM_CH = int(os.getenv("JUDGE_ITEM_CHAR_MAX",  "160"))
+
+    def _dedupe_take(items, k):
+        out, seen = [], set()
+        for it in items or []:
+            if not isinstance(it, str):
+                continue
+            s = re.sub(r"\s+", " ", it.strip())
+            if not s:
+                continue
+            s = s[:MAX_ITEM_CH]
+            key = s.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(s)
+            if len(out) >= k:
+                break
+        return out
+
+    # ---- CV payload (JSON, compact) ----
+    hl = []
+    for s in (cv_full.get("sections") or []):
+        if str(s.get("header", "")).lower() in ("experience", "work experience", "projects"):
+            hl.extend(s.get("bullets") or [])
+    cv_json_for_judge = {
+        "role_claim":       cv_full.get("role_claim"),
+        "seniority_claim":  cv_full.get("seniority_claim"),
+        "years_experience": cv_full.get("years_experience"),
+        "skills":           _dedupe_take(cv_full.get("skills") or [], 20),
+        "experience_highlights": _dedupe_take(hl, MAX_HL),
+    }
+    cv_text = json.dumps(cv_json_for_judge, ensure_ascii=False, separators=(",", ":"))
+
+    # ---- JD payload (JSON, compact, no prose) ----
     if isinstance(jd, str):
-        jd_json, jd_md = parse_json_md(jd)  # raw "JSON --- Markdown"
+        jd_json, jd_md = parse_json_md(jd)   # "JSON --- Markdown"
         jd_json["raw_text"] = jd_md
     else:
-        jd_json = _to_dict(jd)  # Pydantic or dict
-        jd_md = jd_json.get("raw_text", "")
-    job_md = jd_md or jd_json.get("raw_text", "")
-    cv = _to_dict(cv)
+        jd_json = _to_dict(jd)
 
-    # Token-diet JD for speed
-    musts = jd_json.get("must_haves", [])[:8]
-    resp = jd_json.get("responsibilities", [])[:5]
-    jd_desc = "Must haves: " + ", ".join(musts)
-    if resp:
-        jd_desc += "\nTop responsibilities: " + "; ".join(resp)
+    # flatten & dedupe locations
+    locs = []
+    for loc in (jd_json.get("jobLocation") or []):
+        addr = (loc.get("address") or {}) if isinstance(loc, dict) else {}
+        city = addr.get("addressLocality")
+        region = addr.get("addressRegion")
+        country = addr.get("addressCountry")
+        if city and region: locs.append(f"{city}, {region}")
+        elif city:          locs.append(city)
+        elif region:        locs.append(region)
+        elif country:       locs.append(country)
+    locs = _dedupe_take(locs, MAX_LOCS)
 
-    cv_text = cv.get("raw_markdown") or cv.get("raw_text", "")
+    musts = _dedupe_take(jd_json.get("must_haves")       or [], MAX_MUST)
+    nices = _dedupe_take(jd_json.get("nice_to_haves")    or [], MAX_NICE)
+    resps = _dedupe_take(jd_json.get("responsibilities") or [], MAX_RESP)
 
-    # three orthogonal complementary judges (reproducible personas)
+    jd_json_for_judge = {
+        "id":               jd_json.get("id"),  # retained for calibration in downstream, not strictly needed by judge
+        "title":            jd_json.get("title"),
+        "domain":           jd_json.get("domain"),
+        "seniority":        jd_json.get("seniority") or jd_json.get("seniority_hint"),
+        "jobLocationType":  jd_json.get("jobLocationType") or jd_json.get("location_mode"),
+        "locations":        locs,
+        "salary_hint":      jd_json.get("salary_hint"),
+        "must_haves":       musts,
+        "nice_to_haves":    nices,
+        "responsibilities": resps,
+        # deliberately NO raw_text here (major token sink)
+    }
+    jd_text = json.dumps(
+        {k: v for k, v in jd_json_for_judge.items() if v not in (None, [], "")},
+        ensure_ascii=False, separators=(",", ":")
+    )
+
+    # ---- judges (unchanged profiles) ----
     profiles = [
-                   {"label": "conservative", "strictness": 1.15, "focus": ["realism", "tech_depth"],
-                    "weights": {"realism": 0.30, "tech_depth": 0.25, "must_have_coverage": 0.20,
-                                "impact_evidence": 0.10,
-                                "recency_seniority": 0.10, "ats_readability": 0.05},
-                    "view": "must_haves_only"},
-                   {"label": "balanced", "strictness": 1.00, "focus": [],
-                    "weights": {"realism": 0.15, "tech_depth": 0.15, "must_have_coverage": 0.25,
-                                "impact_evidence": 0.20,
-                                "recency_seniority": 0.15, "ats_readability": 0.10},
-                    "view": "full"},
-                   {"label": "optimistic", "strictness": 0.90, "focus": ["impact_evidence", "ats_readability"],
-                    "weights": {"realism": 0.10, "tech_depth": 0.15, "must_have_coverage": 0.20,
-                                "impact_evidence": 0.30,
-                                "recency_seniority": 0.10, "ats_readability": 0.15},
-                    "view": "resp_only"},
-               ][:n_judges]
+        {"label": "conservative", "strictness": 1.15, "focus": ["realism", "tech_depth"],
+         "weights": {"realism": 0.30, "tech_depth": 0.25, "must_have_coverage": 0.20,
+                     "impact_evidence": 0.10, "recency_seniority": 0.10, "ats_readability": 0.05},
+         "view": "must_haves_only"},
+        {"label": "balanced", "strictness": 1.00, "focus": [],
+         "weights": {"realism": 0.15, "tech_depth": 0.15, "must_have_coverage": 0.25,
+                     "impact_evidence": 0.20, "recency_seniority": 0.15, "ats_readability": 0.10},
+         "view": "full"},
+        {"label": "optimistic", "strictness": 0.90, "focus": ["impact_evidence", "ats_readability"],
+         "weights": {"realism": 0.10, "tech_depth": 0.15, "must_have_coverage": 0.20,
+                     "impact_evidence": 0.30, "recency_seniority": 0.10, "ats_readability": 0.15},
+         "view": "resp_only"},
+    ][:n_judges]
 
     # === One-call committee ===
-    committee = run_recruiter_committee_once(jd_desc, cv_text, profiles, jd_json)
+    committee = run_recruiter_committee_once(jd_text, cv_text, profiles, jd_json)
 
-    # If parsing failed or empty, fall back to per-judge calls (rare)
+    # Fallback: per-judge calls with the SAME compact JD/CV payloads
     if not committee or len(committee) < n_judges:
-        # Build orthogonal judge profiles: weights + views + calibration tokens
-        prof_lines = []
         scores = []
         for i, prof in enumerate(profiles):
-            v = prof.get("view", "full")
             j_id = f"judge-{i}"
-            cal = judge_cal_token(j_id, jd_json.get("id", "jd-unk"), cv.get("id", "cv-unk"), cfg.seed)
-            prof_lines.append(
-                " - judge_id: judge-{i}; style: {label}; strictness: {s}; emphasis: {focus}; weights: {w}; view: {v}; calibration_token: {cal}"
-                .format(i=i, label=prof.get("label", "balanced"), s=prof.get("strictness", 1.0),
-                        focus=", ".join(prof.get("focus", [])) or "none", w=prof.get("weights", {}), v=v, cal=cal)
-            )
-            s = run_recruiter_agent_json(jd_desc, cv_text, judge_id=f"judge-{i}", profile=prof)
+            cal = judge_cal_token(j_id, jd_json.get("id", "jd-unk"), cv_full.get("id", "cv-unk"), cfg.seed)
+            s = run_recruiter_agent_json(jd_text, cv_text, judge_id=j_id, profile=prof)
             scores.append({
-                "cv_id": cv["id"], "jd_id": jd_json["id"], "judge_id": s["judge_id"],
-                "subscores": s["subscores"], "overall": float(s["overall"])
+                "cv_id":    cv_full.get("id"),
+                "jd_id":    jd_json.get("id"),
+                "judge_id": s["judge_id"],
+                "subscores": s["subscores"],
+                "overall":  float(s["overall"]),
             })
         return scores
+
     # Use committee results directly (NO extra LLM calls)
     out = []
     for i, s in enumerate(committee[:n_judges]):
-        subs = s["subscores"]
-        prof_w = profiles[i]["weights"]  # weights you passed in
+        subs   = s["subscores"]
+        prof_w = profiles[i]["weights"]
         out.append({
-            "cv_id": cv["id"], "jd_id": jd_json["id"],
+            "cv_id":    cv_full.get("id"),
+            "jd_id":    jd_json.get("id"),
             "judge_id": s.get("judge_id", f"judge-{i}"),
             "subscores": subs,
-            "overall": _weighted_overall(subs, prof_w)
+            "overall":   _weighted_overall(subs, prof_w),
         })
     return out
 
-
 # Helpers
-# -----------------------------
+# -----------------------------bn88
 def _markdown_to_text(md: str) -> str:
     # very light markdown → text (keep it simple for now)
     text = re.sub(r"`{1,3}.*?`{1,3}", "", md, flags=re.DOTALL)  # remove code blocks/inline
@@ -1106,9 +1211,9 @@ def _print_prompt_tokens(model, prompt: str, label: str):
     try:
         ct = model.count_tokens(prompt)
         total = getattr(ct, "total_tokens", None) or ct["total_tokens"]
-        print(f"[tokens] {label}: prompt_total={total}")
+        print(f"[Agent-Token] {label}: prompt_total={total}")
     except Exception as e:
-        print(f"[tokens] {label}: count failed ({e})")
+        print(f"[Agent-Token] {label}: count failed ({e})")
 
 
 def _normalize_job_json(jd_json: dict, jd_md: str) -> dict:

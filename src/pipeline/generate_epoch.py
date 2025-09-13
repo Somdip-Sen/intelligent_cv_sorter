@@ -56,8 +56,15 @@ def run_generation(output_dir: str, generation: int, top_k: float = 0.20):
 
     samples, sigs = [], []
     errors = 0
+    # deterministic one-time shuffle (prevents same item always going first)
+    _rng = random.Random(f"permute|{generation}|{cfg.seed}")
+    jobs_shuf = jobs[:]
+    _rng.shuffle(jobs_shuf)
+    personas_shuf = personas[:]
+    _rng.shuffle(personas_shuf)
+
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-        futs = [ex.submit(_build_sample, pe, jd) for jd in jobs for pe in personas]
+        futs = [ex.submit(_build_sample, pe, jd) for jd in jobs_shuf for pe in personas_shuf]
         for fut in as_completed(futs):
             try:
                 sample, sig = fut.result()
@@ -73,40 +80,61 @@ def run_generation(output_dir: str, generation: int, top_k: float = 0.20):
     sigs.sort(key=lambda s: s[0])
 
     # build LSH for novelty/dup checks
-    lsh = lsh_index([(sid, txt) for sid, txt in sigs], threshold=0.85)
+    lsh = lsh_index([(sid, txt) for sid, txt in sigs], threshold=0.35)
 
     # compute penalties + fitness
     records = []
-    for cv, jd, pe, rs, subs in samples:
+    for cv, jd, pe, rs, subscores in samples:
         penalties = {
             "credential_violation": float("phd" in cv.raw_text.lower() and "phd" not in pe.core_story.lower()),
             "date_incoherence": 0.0,  # TODO: implement date checker
             "keyword_stuffing": float(sum(cv.raw_text.lower().count(t.lower()) for t in jd.must_haves) > 30),
-            "dup_similarity": dup_similarity(lsh, cv.id, cv.raw_text),
+            # Use a non-triggerable threshold so we always get the continuous max est. similarity
+            "dup_similarity": dup_similarity(lsh, cv.id, cv.raw_text, threshold=1.01)
         }
-        novelty = 1.0 - penalties["dup_similarity"]  # so duplicates get lower fitness.
-        fit = fitness(subs, penalties, novelty)
+        novelty = round(1.0 - float(penalties["dup_similarity"]), 4)  # so duplicates get lower fitness.
+        fit = float(fitness(subscores, penalties, novelty))  # ensure float if fitness returned string
+
         rec = SampleRecord(
             generation=generation, cv=cv, jd=jd, persona=pe, scores=rs,
-            meta={"fitness": f"{fit:.4f}", "novelty": f"{novelty:.3f}"}
+            meta={"fitness": round(fit, 4), "novelty": round(novelty, 5)}
         )
         records.append((fit, rec))
+        # existing shuffle + jitter stay as-is
+        rng = random.Random(f"tiebrk|{generation}|{cfg.seed}")
+        rng.shuffle(records)
 
-    # select survivors (top_k) and persist ALL + survivors
-    # select survivors (top_k) and persist ALL + survivors
-    # deterministic tie-break: shuffle with a seeded RNG, then add tiny id-based jitter
-    rng = random.Random(f"tiebrk|{generation}|{cfg.seed}")
-    rng.shuffle(records)
+        def _jitter(cv_id: str) -> float:
+            h = int(hashlib.sha256(cv_id.encode()).hexdigest(), 16)
+            return (h % 1000) / 1e7
 
-    def _jitter(cv_id: str) -> float:
-        h = int(hashlib.sha256(cv_id.encode()).hexdigest(), 16)
-        return (h % 1000) / 1e7  # up to ~0.0000999
+        # Optional fairness: pick top-1 per JD with a fitness floor
+        if os.getenv("PER_JD_TOP", "0") == "1":
+            from collections import defaultdict
+            floor = float(os.getenv("FITNESS_FLOOR", "0.0"))
+            by_jd = defaultdict(list)
+            for f, r in records:
+                by_jd[r.jd.id].append((f, r))
+            survivors = []
+            for _, lst in by_jd.items():
+                lst.sort(key=lambda x: (x[0], float(x[1].meta.get("novelty", 0.0))), reverse=True)
+                if lst and lst[0][0] >= floor:
+                    survivors.append(lst[0][1])
+        else:
+            # select survivors (top_k) and persist ALL + survivors
+            rng = random.Random(f"tiebrk|{generation}|{cfg.seed}")
+            tie_jit = {r.cv.id: rng.random() for _, r in records}  # one tiny jitter per CV (reproducible per gen)
+            EPS = float(os.getenv("FITNESS_TIE_EPS", "0.02"))  # treat scores within 0.02 as "near-ties"
 
-    records.sort(
-        key=lambda x: (x[0] + _jitter(x[1].cv.id)),
-        reverse=True
-    )
-    survivors = [r for _, r in records[: max(1, int(len(records) * top_k))]]
+            def sort_key(item):
+                fit, rec = item
+                nov = float(rec.meta.get("novelty", 0.0))
+                # round fitness into EPS buckets so near-ties prefer higher novelty, then jitter
+                fit_bucket = round(fit / EPS, 0)
+                return fit_bucket, nov, tie_jit[rec.cv.id]
+
+            records.sort(key=sort_key, reverse=True)
+            survivors = [r for _, r in records[: max(1, int(len(records) * top_k))]]
 
     # write artifacts
     save_jsonl(out / f"gen_{generation}_all.jsonl", [r.model_dump(mode="json") for _, r in records])
@@ -164,6 +192,10 @@ if __name__ == "__main__":
     parser.add_argument("--output", required=True)
     parser.add_argument("--generation", type=int, required=True)
     parser.add_argument("--top_k", type=float, default=0.20)
+    parser.add_argument("--PRINT_TOKENS_COUNT", type=int, default=0,
+                        help="1 - if you want to print the token count per call")
+    parser.add_argument("--FITNESS_FLOOR", type=float, default=0.0)  # PER_JD_TOP=1 FITNESS_FLOOR=0.25
+    parser.add_argument("--PER_JD_TOP", type=int, default=1)  # else 0
     args = parser.parse_args()
 
     run_generation(output_dir=args.output, generation=args.generation, top_k=args.top_k)

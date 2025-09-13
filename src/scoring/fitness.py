@@ -5,7 +5,7 @@ Penalties we compute:
 credential_violation, date_incoherence, keyword_stuffing, dup_similarity (each 0–1).
 Novelty (0–1): reward for being unlike others.
 """
-from typing import List, Dict, Optional
+from typing import List, Dict
 import numpy as np
 from src.config.settings import load_cfg
 
@@ -36,8 +36,8 @@ def aggregate_committee(scores: List[Dict[str, float]]) -> Dict[str, float]:
 
 
 def _weighted_subscores_minus_penalties(subscores: Dict[str, float],
-                                        penalties: Dict[str, float],
-                                        cfg: Optional[object] = None, ) -> float:
+                                        penalties: Dict[str, float]
+                                        ) -> float:
     """
     Returns base - penalty.
     - subscores/penalties are expected in [0,1].
@@ -58,26 +58,36 @@ def _weighted_subscores_minus_penalties(subscores: Dict[str, float],
 
     base = sum(float(sw.get(k, 1.0)) * float(subscores.get(k, 0.0)) for k in subscores) / sw_sum
     pen = sum(float(pw.get(k, 1.0)) * float(penalties.get(k, 0.0)) for k in penalties) / pw_sum
-    return float(base) - float(pen)  # in [-1, 1], typically in [0,1] if pen <= base
+    return round(max(0.0, min(1.0, float(base) - float(pen))), 4)  # in [-1, 1], typically in [0,1] if pen <= base
 
 
 def fitness(
-    subscores: Dict[str, float],
-    penalties: Dict[str, float],
-    novelty: float,
-    cfg: Optional[object] = None,
-    novelty_coeff_default: float = 0.10,
+        subscores: Dict[str, float],
+        penalties: Dict[str, float],
+        novelty: float
 ) -> float:
-
     """weighted sum of subscores minus weighted penalties plus a small novelty bonus.
        This gives a single fitness number ∈ [0,1] for selection,
        with λ_novel configurable via cfg.fitness.novelty_coeff.
     """
     # λ_novel
-    novelty_coeff = novelty_coeff_default
-    if cfg and getattr(cfg, "fitness", None) and hasattr(cfg.fitness, "novelty_coeff"):
-        novelty_coeff = float(cfg.fitness.novelty_coeff) # novelty in [0,1]; encourage diversity
+    # 1) base from judges (prefer committee overall, else weighted subscores)
+    w = {
+        "must_have_coverage": 0.40,
+        "tech_depth": 0.25,
+        "impact_evidence": 0.20,
+        "recency_seniority": 0.10,
+        "ats_readability": 0.03,
+        "realism": 0.02,
+    }
+    base = sum(w[k] * float(subscores.get(k, 0.0)) for k in w)
 
-    core = _weighted_subscores_minus_penalties(subscores, penalties, cfg)  # base - penalty
-    raw = core + novelty_coeff * float(novelty)
-    return max(0.0, min(1.0, float(raw)))
+    # 2) light, interpretable penalties (no regexes, still agent-first)
+    dup = float(penalties.get("dup_similarity", 0.0))
+    must = float(subscores.get("must_have_coverage", 0.0))
+
+    # give bite to duplicates and missing must-haves
+    score = base - 0.45 * dup - 0.15 * (1.0 - must)
+
+    # 3) clamp+round, return FLOAT
+    return round(max(0.0, min(1.0, score)), 4)

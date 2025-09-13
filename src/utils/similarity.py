@@ -3,7 +3,7 @@
 """
 Method: MinHash + LSH
 how to run:
-idx = lsh_index(samples=[], threshold=0.85, num_perm=128, shingle_k=5)
+idx = lsh_index(samples=[], threshold=0.85, num_perm=512, shingle_k=5)
 Insert as you generate CVs: idx.insert(sample_id, cv_text)
 When scoring a new CV:
 dup_sim = dup_similarity(idx, sample_id, cv_text)  # 1.0 if duplicate cluster hit
@@ -22,22 +22,27 @@ import re
 _HAS_DATASKETCH = False
 try:
     from datasketch import MinHash as DSMinHash, MinHashLSH as DSMinHashLSH
+
     _HAS_DATASKETCH = True
 except Exception:
     _HAS_DATASKETCH = False
+
 
 # ---------- shared helpers ----------
 def _normalize_text(text: str) -> str:
     return re.sub(r"\s+", " ", text.strip().lower())
 
+
 def _tokenize_words(text: str) -> List[str]:
     # Simple word tokenizer: words & numbers
     return re.findall(r"[a-z0-9]+", text.lower())
 
+
 def _k_shingles(tokens: List[str], k: int) -> Set[str]:
     if k <= 1:
         return set(tokens)
-    return {" ".join(tokens[i : i + k]) for i in range(max(0, len(tokens) - k + 1))}
+    return {" ".join(tokens[i: i + k]) for i in range(max(0, len(tokens) - k + 1))}
+
 
 # ---------- datasketch backend ----------
 @dataclass
@@ -78,17 +83,21 @@ class _DSIndex:
         # datasketch exposes exact MinHash Jaccard estimate
         return float(mh_a.jaccard(mh_b))
 
+
 # ---------- builtin backend ----------
 # Large prime (fits in 64-bit). 2^61 - 1 is a Mersenne prime.
 _LARGE_PRIME = (1 << 61) - 1
+
 
 def _hash64(s: str) -> int:
     # Stable 64-bit hash via blake2b digest_size=8
     return int.from_bytes(hashlib.blake2b(s.encode("utf-8"), digest_size=8).digest(), "big")
 
+
 def _make_permutations(num_perm: int, seed: int = 1337) -> List[Tuple[int, int]]:
     rnd = random.Random(seed)
     return [(rnd.randrange(1, _LARGE_PRIME - 1), rnd.randrange(0, _LARGE_PRIME - 1)) for _ in range(num_perm)]
+
 
 def _minhash_signature(shingle_hashes: Iterable[int], perms: List[Tuple[int, int]]) -> List[int]:
     sig = []
@@ -102,6 +111,7 @@ def _minhash_signature(shingle_hashes: Iterable[int], perms: List[Tuple[int, int
         sig.append(mn)
     return sig
 
+
 def _select_bands(num_perm: int) -> Tuple[int, int]:
     """
         Choose (#bands, rows_per_band) so that bands * rows = num_perm.
@@ -114,7 +124,8 @@ def _select_bands(num_perm: int) -> Tuple[int, int]:
     for b in range(32, 1, -1):
         if num_perm % b == 0:
             return b, num_perm // b
-    return num_perm, 1 # degenerate
+    return num_perm, 1  # degenerate
+
 
 @dataclass
 class _BuiltinIndex:
@@ -176,6 +187,7 @@ class _BuiltinIndex:
         eq = sum(1 for x, y in zip(sig_a, sig_b) if x == y)
         return float(eq) / float(len(sig_a))
 
+
 # ---------- public factory & API ----------
 @dataclass
 class LSHIndex:
@@ -189,13 +201,14 @@ class LSHIndex:
     def insert(self, sid: str, text: str) -> None:
         self.impl.insert(sid, text)
 
+
 def lsh_index(
-    samples: Iterable[Tuple[str, str]],
-    threshold: float = 0.85,
-    num_perm: int = 128,
-    shingle_k: int = 5,
-    seed: int = 1337,
-    backend: str = "auto",  # "auto" | "datasketch" | "builtin"
+        samples: Iterable[Tuple[str, str]],
+        threshold: float = 0.85,
+        num_perm: int = 512,
+        shingle_k: int = 5,
+        seed: int = 1337,
+        backend: str = "auto",  # "auto" | "datasketch" | "builtin"
 ) -> LSHIndex:
     """
         Build an LSH index from (sid, text) samples.
@@ -217,11 +230,12 @@ def lsh_index(
         idx.insert(str(sid), text)
     return idx
 
+
 def dup_similarity(
-    lsh: LSHIndex,
-    sid: str,
-    text: str,
-    threshold: Optional[float] = None,
+        lsh: LSHIndex,
+        sid: str,
+        text: str,
+        threshold: Optional[float] = None,
 ) -> float:
     """
     Return the maximum estimated Jaccard similarity between `text` and any
@@ -239,18 +253,14 @@ def dup_similarity(
         # datasketch path
         impl: _DSIndex = lsh.impl  # type: ignore
         mh_q = impl._minhash_for_text(text)
-        cands = impl.query_candidates(mh_q)
-        if sid in cands:
-            try:
-                cands.remove(sid)
-            except Exception:
-                pass
+        cands = [c for c in impl.query_candidates(mh_q) if str(c) != str(sid)]
+        pool = cands if cands else [c for c in impl.minhashes.keys() if str(c) != str(sid)]  # fallback scan
         best = 0.0
-        for cid in cands:
+        for cid in pool:
             mh_c = impl.minhashes.get(cid)
             if mh_c is None:
                 continue
-            est = _DSIndex.est_jaccard(mh_q, mh_c)
+            est = _DSIndex.est_jaccard(mh_q, mh_c)  # max estimated Jaccard similarity
             if est >= th:
                 return 1.0
             if est > best:
@@ -261,9 +271,7 @@ def dup_similarity(
         # builtin path
         impl: _BuiltinIndex = lsh.impl  # type: ignore
         sig_q = impl._signature_for_text(text)
-        cands = impl.query_candidates_by_sig(sig_q)
-        if sid in cands:
-            cands.discard(sid)
+        cands = {c for c in impl.query_candidates_by_sig(sig_q) if str(c) != str(sid)}
         best = 0.0
         for cid in cands:
             sig_c = impl.signatures.get(cid)
